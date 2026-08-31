@@ -1466,6 +1466,11 @@ impl Connection {
         if newly_acked.is_empty() {
             return Ok(());
         }
+        self.stats.path.acked_packets = self
+            .stats
+            .path
+            .acked_packets
+            .saturating_add(newly_acked.len() as u64);
 
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {

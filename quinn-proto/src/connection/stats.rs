@@ -140,6 +140,11 @@ pub struct PathStats {
     pub cwnd: u64,
     /// Congestion events on the connection
     pub congestion_events: u64,
+    /// Number of sent packets newly acknowledged by the peer
+    ///
+    /// This is a delivery-progress counter, unlike `FrameStats::acks`, which
+    /// counts every ACK frame including duplicate ACK ranges.
+    pub acked_packets: u64,
     /// The amount of packets lost on this path
     pub lost_packets: u64,
     /// The amount of bytes lost on this path
