@@ -355,7 +355,7 @@ pub(crate) struct TooManyChunks;
 ///
 /// Independent of how much memory those spans over-allocate. A frame is rejected only
 /// if compaction cannot get the count back down to this.
-const MAX_CHUNKS: usize = 1024;
+const MAX_CHUNKS: usize = 16384;
 
 /// Chunk count past which `insert` compacts before deciding whether to reject
 ///
