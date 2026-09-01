@@ -109,7 +109,7 @@ impl Recv {
     /// transmission of the value is recommended. If the boolean value is
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
-    pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
+    pub(super) fn max_stream_data(&self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
         let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
 
         // Only announce a window update if it's significant enough
@@ -119,7 +119,7 @@ impl Recv {
         // less updates. A fixed size would also work - but it would need to be
         // smaller than `stream_receive_window` in order to make sure the stream
         // does not get stuck.
-        let diff = max_stream_data - self.sent_max_stream_data;
+        let diff = max_stream_data.saturating_sub(self.sent_max_stream_data);
         let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
         (max_stream_data, ShouldTransmit(transmit))
     }
@@ -133,6 +133,11 @@ impl Recv {
         if sent_value > self.sent_max_stream_data {
             self.sent_max_stream_data = sent_value;
         }
+    }
+
+    pub(super) fn max_stream_data_increases(&self, stream_receive_window: u64) -> bool {
+        self.can_send_flow_control()
+            && self.assembler.bytes_read() + stream_receive_window > self.sent_max_stream_data
     }
 
     /// Whether the total amount of data that the peer will send on this stream is unknown
@@ -270,11 +275,14 @@ impl<'a> Chunks<'a> {
             Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
-        let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::ClosedStream),
-                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
-            };
+        let mut recv = match get_or_insert_recv(streams.initial_stream_receive_window)(
+            entry.get_mut(),
+        )
+        .stopped
+        {
+            true => return Err(ReadableError::ClosedStream),
+            false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
+        };
 
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
@@ -366,7 +374,7 @@ impl<'a> Chunks<'a> {
         let mut should_transmit = self.streams.queue_max_stream_id(self.pending);
 
         // If the stream hasn't finished, we may need to issue stream-level flow control credit
-        if let ChunksState::Readable(mut rs) = state {
+        if let ChunksState::Readable(rs) = state {
             let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
             should_transmit |= max_stream_data.0;
             if max_stream_data.0 {

@@ -1430,6 +1430,15 @@ impl Connection {
         }
     }
 
+    /// See [`TransportConfig::stream_receive_window()`]. Increasing this queues credit for open
+    /// streams; reducing it cannot retract credit already advertised to the peer.
+    pub fn set_stream_receive_window(&mut self, stream_receive_window: VarInt) {
+        self.streams.set_stream_receive_window(
+            stream_receive_window,
+            &mut self.spaces[SpaceId::Data].pending,
+        );
+    }
+
     fn on_ack_received(
         &mut self,
         now: Instant,
@@ -2799,9 +2808,12 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
+                    let id = frame.id;
                     if self.streams.received(frame, payload_len)?.should_transmit() {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
+                    self.streams
+                        .queue_stream_receive_window(id, &mut self.spaces[SpaceId::Data].pending);
                 }
                 Frame::Ack(ack) => {
                     self.on_ack_received(now, SpaceId::Data, ack)?;

@@ -129,6 +129,8 @@ pub struct StreamsState {
     pub(super) send_window: u64,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
+    /// Stream receive window advertised in the transport parameters.
+    pub(super) initial_stream_receive_window: u64,
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -177,6 +179,7 @@ impl StreamsState {
             unacked_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
+            initial_stream_receive_window: stream_receive_window.into(),
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
@@ -263,7 +266,7 @@ impl StreamsState {
         let rs = match self
             .recv
             .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
+            .map(get_or_insert_recv(self.initial_stream_receive_window))
         {
             Some(rs) => rs,
             None => {
@@ -316,7 +319,7 @@ impl StreamsState {
         let rs = match self
             .recv
             .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
+            .map(get_or_insert_recv(self.initial_stream_receive_window))
         {
             Some(stream) => stream,
             None => {
@@ -881,6 +884,44 @@ impl StreamsState {
         expanded
     }
 
+    pub(crate) fn set_stream_receive_window(
+        &mut self,
+        stream_receive_window: VarInt,
+        pending: &mut Retransmits,
+    ) {
+        let stream_receive_window = stream_receive_window.into();
+        let expanded = stream_receive_window > self.stream_receive_window;
+        self.stream_receive_window = stream_receive_window;
+        if !expanded {
+            return;
+        }
+
+        pending
+            .max_stream_data
+            .extend(self.recv.iter().filter_map(|(&id, stream)| {
+                stream
+                    .as_ref()?
+                    .as_open_recv()?
+                    .max_stream_data_increases(stream_receive_window)
+                    .then_some(id)
+            }));
+    }
+
+    pub(crate) fn queue_stream_receive_window(&self, id: StreamId, pending: &mut Retransmits) {
+        if self.stream_receive_window <= self.initial_stream_receive_window {
+            return;
+        }
+        if self
+            .recv
+            .get(&id)
+            .and_then(|stream| stream.as_ref())
+            .and_then(|stream| stream.as_open_recv())
+            .is_some_and(|stream| stream.max_stream_data_increases(self.stream_receive_window))
+        {
+            pending.max_stream_data.insert(id);
+        }
+    }
+
     pub(crate) fn flow_control_stats(&self) -> FlowControlStats {
         let stream_receive_window_available = self
             .recv
@@ -961,7 +1002,8 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.free_recv
+            .push(recv.free(self.initial_stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1898,7 +1940,7 @@ mod tests {
         let mut client = make(Side::Client);
         let window = client.receive_window;
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
-        client
+        let _ = client
             .received(
                 frame::Stream {
                     id,
@@ -1928,6 +1970,7 @@ mod tests {
         let mut server = make(Side::Server);
         let new_receive_window = 2 * server.receive_window as u32;
         let expanded = server.set_receive_window(new_receive_window.into());
+
         assert!(expanded);
         assert_eq!(server.receive_window, new_receive_window as u64);
         assert_eq!(server.local_max_data, new_receive_window as u64);
@@ -1940,6 +1983,64 @@ mod tests {
         assert_eq!(server.receive_window_shrink_debt, 0);
         assert_eq!(server.local_max_data, prev_local_max_data + credits);
         assert!(should_transmit.should_transmit());
+    }
+
+    #[test]
+    fn runtime_stream_receive_window_queues_active_and_future_streams() {
+        let mut client = make(Side::Client);
+        let old_window = client.stream_receive_window;
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+
+        let mut pending = Retransmits::default();
+        client.set_stream_receive_window(VarInt::try_from(old_window * 2).unwrap(), &mut pending);
+        assert_eq!(client.stream_receive_window, old_window * 2);
+        assert!(pending.max_stream_data.contains(&id));
+
+        pending.max_stream_data.clear();
+        client.set_stream_receive_window(VarInt::try_from(old_window / 2).unwrap(), &mut pending);
+        assert_eq!(client.stream_receive_window, old_window / 2);
+        assert!(pending.max_stream_data.is_empty());
+        let recv = client
+            .recv
+            .get_mut(&id)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .as_open_recv_mut()
+            .unwrap();
+        assert!(!recv.max_stream_data(old_window / 2).1.should_transmit());
+
+        let mut future_client = make(Side::Client);
+        let mut future_pending = Retransmits::default();
+        future_client.set_stream_receive_window(
+            VarInt::try_from(old_window * 2).unwrap(),
+            &mut future_pending,
+        );
+        assert!(future_pending.max_stream_data.is_empty());
+        let _ = future_client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+        future_client.queue_stream_receive_window(id, &mut future_pending);
+        assert!(future_pending.max_stream_data.contains(&id));
     }
 
     #[test]
