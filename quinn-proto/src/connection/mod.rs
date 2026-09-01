@@ -1466,11 +1466,13 @@ impl Connection {
         if newly_acked.is_empty() {
             return Ok(());
         }
+        let newly_acked_count = Self::acked_packet_count(&newly_acked);
+
         self.stats.path.acked_packets = self
             .stats
             .path
             .acked_packets
-            .saturating_add(newly_acked.len() as u64);
+            .saturating_add(newly_acked_count);
 
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
@@ -1551,6 +1553,12 @@ impl Connection {
 
         self.set_loss_detection_timer(now);
         Ok(())
+    }
+
+    fn acked_packet_count(ranges: &ArrayRangeSet) -> u64 {
+        ranges.iter().fold(0u64, |count, range| {
+            count.saturating_add(range.end.saturating_sub(range.start))
+        })
     }
 
     /// Process a new ECN block from an in-order ACK
@@ -4075,5 +4083,13 @@ mod tests {
             assert_eq!(negotiate_max_idle_timeout(left, right), result);
             assert_eq!(negotiate_max_idle_timeout(right, left), result);
         }
+    }
+    #[test]
+    fn acked_packet_count_counts_elements_not_ranges() {
+        let mut ranges = ArrayRangeSet::new();
+        ranges.insert(10..13);
+        ranges.insert(20..22);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(Connection::acked_packet_count(&ranges), 5);
     }
 }
