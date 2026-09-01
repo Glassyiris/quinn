@@ -169,6 +169,28 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+/// Stream flow-control state.
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct FlowControlStats {
+    /// Unique stream bytes received, including gaps in stream offsets.
+    pub received_bytes: u64,
+    /// Stream bytes accepted for transmission.
+    pub sent_bytes: u64,
+    /// Configured cap on unacknowledged stream bytes.
+    pub send_window: u64,
+    /// Send-window capacity not currently occupied by unacknowledged stream bytes.
+    pub send_window_available: u64,
+    /// Configured connection-level receive window.
+    pub receive_window: u64,
+    /// Connection-level credit currently advertised but not yet consumed.
+    pub receive_window_available: u64,
+    /// Configured per-stream receive window.
+    pub stream_receive_window: u64,
+    /// Lowest advertised-but-unconsumed credit among open receive streams.
+    pub stream_receive_window_available: Option<u64>,
+}
+
 /// Connection statistics
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
@@ -183,4 +205,6 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// Receive-side flow-control state
+    pub flow_control: FlowControlStats,
 }

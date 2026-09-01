@@ -75,7 +75,7 @@ use spaces::Retransmits;
 use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{ConnectionStats, FlowControlStats, FrameStats, PathStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -1265,6 +1265,7 @@ impl Connection {
         stats.path.rtt = self.path.rtt.get();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        stats.flow_control = self.streams.flow_control_stats();
 
         stats
     }

@@ -153,6 +153,11 @@ impl Recv {
         self.final_offset_unknown() && !self.stopped
     }
 
+    pub(super) fn flow_control_available(&self) -> Option<u64> {
+        self.can_send_flow_control()
+            .then(|| self.sent_max_stream_data.saturating_sub(self.end))
+    }
+
     /// Whether data is still being accepted from the peer
     pub(super) fn is_receiving(&self) -> bool {
         matches!(self.state, RecvState::Recv { .. })

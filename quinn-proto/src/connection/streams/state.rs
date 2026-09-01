@@ -15,7 +15,7 @@ use super::{
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
-    connection::stats::FrameStats,
+    connection::stats::{FlowControlStats, FrameStats},
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
 };
@@ -879,6 +879,24 @@ impl StreamsState {
         }
         self.receive_window = receive_window;
         expanded
+    }
+
+    pub(crate) fn flow_control_stats(&self) -> FlowControlStats {
+        let stream_receive_window_available = self
+            .recv
+            .values()
+            .filter_map(|stream| stream.as_ref()?.as_open_recv()?.flow_control_available())
+            .min();
+        FlowControlStats {
+            received_bytes: self.data_recvd,
+            sent_bytes: self.data_sent,
+            send_window: self.send_window,
+            send_window_available: self.send_window.saturating_sub(self.unacked_data),
+            receive_window: self.receive_window,
+            receive_window_available: u64::from(self.sent_max_data).saturating_sub(self.data_recvd),
+            stream_receive_window: self.stream_receive_window,
+            stream_receive_window_available,
+        }
     }
 
     pub(super) fn insert(&mut self, remote: bool, id: StreamId) {
@@ -1873,6 +1891,36 @@ mod tests {
             assert_eq!(client.max_remote[Dir::Uni as usize], 200);
             assert_eq!(client.max_remote[Dir::Bi as usize], 201);
         }
+    }
+
+    #[test]
+    fn flow_control_stats_track_available_credit() {
+        let mut client = make(Side::Client);
+        let window = client.receive_window;
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+        client.data_sent = 200;
+        client.unacked_data = 100;
+
+        let stats = client.flow_control_stats();
+        assert_eq!(stats.received_bytes, 100);
+        assert_eq!(stats.sent_bytes, 200);
+        assert_eq!(stats.send_window, 1024 * 1024);
+        assert_eq!(stats.send_window_available, 1024 * 1024 - 100);
+        assert_eq!(stats.receive_window, window);
+        assert_eq!(stats.receive_window_available, window - 100);
+        assert_eq!(stats.stream_receive_window, window);
+        assert_eq!(stats.stream_receive_window_available, Some(window - 100));
     }
 
     #[test]
