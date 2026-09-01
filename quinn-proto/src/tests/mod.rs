@@ -1402,6 +1402,31 @@ fn stream_flow_control() {
 }
 
 #[test]
+fn runtime_stream_window_unblocks_future_stream() {
+    let mut server_config = server_config();
+    server_config.transport = Arc::new(TransportConfig {
+        stream_receive_window: 0u32.into(),
+        ..TransportConfig::default()
+    });
+    let mut pair = Pair::new(Default::default(), server_config);
+    let (client_ch, server_ch) = pair.connect();
+    pair.server_conn_mut(server_ch)
+        .set_stream_receive_window(2000u32.into());
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let data = [0; 2000];
+
+    assert_eq!(
+        pair.client_send(client_ch, stream).write(&data),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_eq!(
+        pair.client_send(client_ch, stream).write(&data),
+        Ok(data.len())
+    );
+}
+
+#[test]
 fn conn_flow_control() {
     test_flow_control(
         TransportConfig {

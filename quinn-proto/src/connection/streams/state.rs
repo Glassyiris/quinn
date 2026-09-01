@@ -524,6 +524,25 @@ impl StreamsState {
             stats.max_stream_data += 1;
         }
 
+        while buf.len() + 17 < max_size {
+            let Some(id) = pending.stream_data_blocked.iter().next().copied() else {
+                break;
+            };
+            pending.stream_data_blocked.remove(&id);
+            let Some(stream) = self.send.get(&id).and_then(|stream| stream.as_ref()) else {
+                continue;
+            };
+            let offset = stream.pending.offset();
+            if offset < stream.max_data || stream.is_reset() {
+                continue;
+            }
+            retransmits.get_or_create().stream_data_blocked.insert(id);
+            buf.write(frame::FrameType::STREAM_DATA_BLOCKED);
+            buf.write(id);
+            buf.write_var(offset);
+            stats.stream_data_blocked += 1;
+        }
+
         // MAX_STREAMS
         for dir in Dir::iter() {
             if !pending.max_stream_id[dir as usize] || buf.len() + 9 >= max_size {

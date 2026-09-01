@@ -152,6 +152,7 @@ impl SendStream {
             Ok(result) => result,
             Err(Blocked) => {
                 conn.blocked_writers.insert(self.stream, cx.waker().clone());
+                conn.wake();
                 return Poll::Pending;
             }
             Err(Stopped(error_code)) => {

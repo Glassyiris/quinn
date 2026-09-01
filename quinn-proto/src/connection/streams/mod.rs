@@ -276,7 +276,13 @@ impl<'a> SendStream<'a> {
         }
 
         let was_pending = stream.is_pending();
-        let written = stream.write(source, limit)?;
+        let written = match stream.write(source, limit) {
+            Err(WriteError::Blocked) => {
+                self.pending.stream_data_blocked.insert(self.id);
+                return Err(WriteError::Blocked);
+            }
+            result => result?,
+        };
         self.state.data_sent += written.bytes as u64;
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
