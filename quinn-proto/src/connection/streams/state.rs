@@ -928,12 +928,17 @@ impl StreamsState {
             return;
         }
 
+        let side = self.side;
+        let next_remote = self.next_remote;
+        let initial_window = self.initial_stream_receive_window;
         pending
             .max_stream_data
-            .extend(self.recv.iter().filter_map(|(&id, stream)| {
-                stream
-                    .as_ref()?
-                    .as_open_recv()?
+            .extend(self.recv.iter_mut().filter_map(|(&id, stream)| {
+                let open = id.initiator() == side || id.index() < next_remote[id.dir() as usize];
+                if !open {
+                    return None;
+                }
+                get_or_insert_recv(initial_window)(stream)
                     .max_stream_data_increases(stream_receive_window)
                     .then_some(id)
             }));
@@ -2141,6 +2146,50 @@ mod tests {
             .unwrap();
         future_client.queue_stream_receive_window(id, &mut future_pending);
         assert!(future_pending.max_stream_data.is_empty());
+    }
+
+    #[test]
+    fn runtime_stream_receive_window_credits_unmaterialized_open_streams() {
+        let mut client = make(Side::Client);
+        let old_window = client.stream_receive_window;
+        client.set_params(&TransportParameters {
+            initial_max_streams_bidi: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let mut pending = Retransmits::default();
+        let state = ConnState::Established;
+        let local_id = Streams {
+            state: &mut client,
+            pending: &mut pending,
+            conn_state: &state,
+        }
+        .open(Dir::Bi)
+        .unwrap();
+        let remote_id = StreamId::new(Side::Server, Dir::Bi, 0);
+        let unopened_remote_id = StreamId::new(Side::Server, Dir::Bi, 1);
+        client.received_max_stream_data(remote_id, 1).unwrap();
+        assert!(client.recv[&local_id].is_none());
+        assert!(client.recv[&remote_id].is_none());
+
+        client.set_stream_receive_window(VarInt::try_from(old_window * 2).unwrap(), &mut pending);
+
+        assert!(pending.max_stream_data.remove(&local_id));
+        assert!(pending.max_stream_data.remove(&remote_id));
+        assert!(!pending.max_stream_data.contains(&unopened_remote_id));
+        assert!(
+            client.recv[&local_id]
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .is_some()
+        );
+        assert!(
+            client.recv[&remote_id]
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .is_some()
+        );
     }
 
     #[test]
