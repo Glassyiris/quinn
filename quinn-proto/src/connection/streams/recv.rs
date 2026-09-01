@@ -120,7 +120,8 @@ impl Recv {
         // smaller than `stream_receive_window` in order to make sure the stream
         // does not get stuck.
         let diff = max_stream_data.saturating_sub(self.sent_max_stream_data);
-        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
+        let transmit =
+            self.can_send_flow_control() && diff != 0 && diff >= (stream_receive_window / 8);
         (max_stream_data, ShouldTransmit(transmit))
     }
 
@@ -578,5 +579,13 @@ mod tests {
             recv.max_stream_data(u64::from(VarInt::MAX)).0,
             u64::from(VarInt::MAX)
         );
+    }
+
+    #[test]
+    fn zero_window_does_not_queue_non_increasing_credit() {
+        let recv = Recv::new(8);
+        let (max, transmit) = recv.max_stream_data(0);
+        assert_eq!(max, 0);
+        assert!(!transmit.should_transmit());
     }
 }

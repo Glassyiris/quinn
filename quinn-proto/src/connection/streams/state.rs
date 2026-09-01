@@ -265,6 +265,24 @@ impl StreamsState {
         frame: frame::Stream,
         payload_len: usize,
     ) -> Result<ShouldTransmit, TransportError> {
+        self.received_inner(frame, payload_len, None)
+    }
+
+    pub(crate) fn received_and_queue(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+        pending: &mut Retransmits,
+    ) -> Result<ShouldTransmit, TransportError> {
+        self.received_inner(frame, payload_len, Some(pending))
+    }
+
+    fn received_inner(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+        pending: Option<&mut Retransmits>,
+    ) -> Result<ShouldTransmit, TransportError> {
         let id = frame.id;
         self.validate_receive_id(id).inspect_err(|_e| {
             debug!("received illegal STREAM frame");
@@ -281,6 +299,13 @@ impl StreamsState {
                 return Ok(ShouldTransmit(false));
             }
         };
+        if self.stream_receive_window > self.initial_stream_receive_window
+            && rs.max_stream_data_increases(self.stream_receive_window)
+        {
+            if let Some(pending) = pending {
+                pending.max_stream_data.insert(id);
+            }
+        }
 
         if !rs.is_receiving() {
             trace!("dropping frame for finished stream");
@@ -419,6 +444,13 @@ impl StreamsState {
             .is_some_and(|s| s.can_send_flow_control())
     }
 
+    pub(crate) fn can_send_stream_data_blocked(&self, id: StreamId) -> bool {
+        self.send
+            .get(&id)
+            .and_then(|stream| stream.as_ref())
+            .is_some_and(|stream| stream.is_stream_data_blocked())
+    }
+
     pub(in crate::connection) fn write_control_frames(
         &mut self,
         buf: &mut Vec<u8>,
@@ -532,10 +564,10 @@ impl StreamsState {
             let Some(stream) = self.send.get(&id).and_then(|stream| stream.as_ref()) else {
                 continue;
             };
-            let offset = stream.pending.offset();
-            if offset < stream.max_data || stream.is_reset() {
+            if !stream.is_stream_data_blocked() {
                 continue;
             }
+            let offset = stream.pending.offset();
             retransmits.get_or_create().stream_data_blocked.insert(id);
             buf.write(frame::FrameType::STREAM_DATA_BLOCKED);
             buf.write(id);
@@ -2400,5 +2432,51 @@ mod tests {
         // Assert that only `smaller_send_window` bytes are accepted
         assert_eq!(stream.write(&data), Ok(smaller_send_window as usize));
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+    }
+
+    #[test]
+    fn stream_data_blocked_is_deduplicated_and_stale_safe() {
+        let mut client = make(Side::Client);
+        client.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_streams_uni: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let mut pending = Retransmits::default();
+        let conn_state = ConnState::Established;
+        let id = Streams {
+            state: &mut client,
+            pending: &mut pending,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        {
+            let mut stream = SendStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            };
+            assert_eq!(stream.write(b"x"), Err(WriteError::Blocked));
+            assert_eq!(stream.write(b"x"), Err(WriteError::Blocked));
+        }
+        assert_eq!(pending.stream_data_blocked.len(), 1);
+        assert!(!pending.is_empty(&client));
+
+        client.received_max_stream_data(id, 1).unwrap();
+        assert!(pending.is_empty(&client));
+        {
+            let mut stream = SendStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            };
+            assert_eq!(stream.write(b"x"), Ok(1));
+            assert_eq!(stream.write(b"x"), Err(WriteError::Blocked));
+        }
+        assert!(pending.stream_data_blocked.contains(&id));
+        assert!(!pending.is_empty(&client));
     }
 }

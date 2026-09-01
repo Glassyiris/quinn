@@ -360,7 +360,10 @@ impl Retransmits {
                 .max_stream_data
                 .iter()
                 .all(|&id| !streams.can_send_flow_control(id))
-            && self.stream_data_blocked.is_empty()
+            && self
+                .stream_data_blocked
+                .iter()
+                .all(|&id| !streams.can_send_stream_data_blocked(id))
             && self.crypto.is_empty()
             && self.new_cids.is_empty()
             && self.retire_cids.is_empty()

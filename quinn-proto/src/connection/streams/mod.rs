@@ -278,7 +278,9 @@ impl<'a> SendStream<'a> {
         let was_pending = stream.is_pending();
         let written = match stream.write(source, limit) {
             Err(WriteError::Blocked) => {
-                self.pending.stream_data_blocked.insert(self.id);
+                if stream.queue_stream_data_blocked() {
+                    self.pending.stream_data_blocked.insert(self.id);
+                }
                 return Err(WriteError::Blocked);
             }
             result => result?,

@@ -2809,12 +2809,14 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
-                    let id = frame.id;
-                    if self.streams.received(frame, payload_len)?.should_transmit() {
-                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    let pending = &mut self.spaces[SpaceId::Data].pending;
+                    if self
+                        .streams
+                        .received_and_queue(frame, payload_len, pending)?
+                        .should_transmit()
+                    {
+                        pending.max_data = true;
                     }
-                    self.streams
-                        .queue_stream_receive_window(id, &mut self.spaces[SpaceId::Data].pending);
                 }
                 Frame::Ack(ack) => {
                     self.on_ack_received(now, SpaceId::Data, ack)?;
