@@ -215,6 +215,9 @@ impl PacketBuilder {
         conn.path
             .sent(exact_number, packet, &mut conn.spaces[space_id]);
         conn.stats.path.sent_packets += 1;
+        if ack_eliciting {
+            conn.stats.path.sent_ack_eliciting_packets += 1;
+        }
         conn.reset_keep_alive(now);
         if size != 0 {
             if ack_eliciting {
