@@ -1151,6 +1151,7 @@ mod tests {
         chunks.next(1024).unwrap();
         let _ = chunks.finalize();
         assert_eq!(client.local_max_data - initial_max, 1024);
+        assert_eq!(client.flow_control_stats().received_bytes, 1024);
         assert_eq!(
             client
                 .received_reset(frame::ResetStream {
@@ -1164,6 +1165,7 @@ mod tests {
 
         assert_eq!(client.data_recvd, 4096);
         assert_eq!(client.local_max_data - initial_max, 4096);
+        assert_eq!(client.flow_control_stats().received_bytes, 1024);
 
         // Ensure reading after a reset doesn't issue redundant credit
         let mut recv = RecvStream {
@@ -1746,6 +1748,7 @@ mod tests {
         };
         stream.write(b"hello").unwrap();
         stream.reset(0u32.into()).unwrap();
+        assert_eq!(stream.state.flow_control_stats().sent_bytes, 0);
 
         assert_eq!(pending.reset_stream, &[(id, 0u32.into())]);
         assert!(!server.can_send_stream_data());
