@@ -139,6 +139,14 @@ impl Recv {
         self.can_send_flow_control()
             && self.assembler.bytes_read() + stream_receive_window > self.sent_max_stream_data
     }
+    pub(super) fn needs_initial_window_update(
+        &self,
+        initial_window: u64,
+        current_window: u64,
+    ) -> bool {
+        self.sent_max_stream_data == initial_window
+            && self.max_stream_data_increases(current_window)
+    }
 
     /// Whether the total amount of data that the peer will send on this stream is unknown
     ///

@@ -914,9 +914,13 @@ impl StreamsState {
         if self
             .recv
             .get(&id)
-            .and_then(|stream| stream.as_ref())
-            .and_then(|stream| stream.as_open_recv())
-            .is_some_and(|stream| stream.max_stream_data_increases(self.stream_receive_window))
+            .and_then(|stream| stream.as_ref()?.as_open_recv())
+            .is_some_and(|stream| {
+                stream.needs_initial_window_update(
+                    self.initial_stream_receive_window,
+                    self.stream_receive_window,
+                )
+            })
         {
             pending.max_stream_data.insert(id);
         }
@@ -2041,6 +2045,44 @@ mod tests {
             .unwrap();
         future_client.queue_stream_receive_window(id, &mut future_pending);
         assert!(future_pending.max_stream_data.contains(&id));
+
+        {
+            let recv = future_client
+                .recv
+                .get_mut(&id)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .as_open_recv_mut()
+                .unwrap();
+            let (advertised, _) = recv.max_stream_data(old_window * 2);
+            recv.record_sent_max_stream_data(advertised);
+        }
+        future_pending.max_stream_data.clear();
+        let mut read_pending = Retransmits::default();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut future_client,
+                pending: &mut read_pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            assert_eq!(chunks.next(1).unwrap().unwrap().bytes.len(), 1);
+            assert!(!chunks.finalize().should_transmit());
+        }
+        let _ = future_client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 100,
+                    fin: false,
+                    data: Bytes::from_static(&[0]),
+                },
+                1,
+            )
+            .unwrap();
+        future_client.queue_stream_receive_window(id, &mut future_pending);
+        assert!(future_pending.max_stream_data.is_empty());
     }
 
     #[test]
