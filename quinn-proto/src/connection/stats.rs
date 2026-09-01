@@ -173,9 +173,9 @@ pub struct PathStats {
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
 pub struct FlowControlStats {
-    /// Unique stream bytes received, including gaps in stream offsets.
+    /// Stream bytes delivered to the application.
     pub received_bytes: u64,
-    /// Stream bytes accepted for transmission.
+    /// Stream bytes acknowledged by the peer.
     pub sent_bytes: u64,
     /// Configured cap on unacknowledged stream bytes.
     pub send_window: u64,
@@ -187,8 +187,6 @@ pub struct FlowControlStats {
     pub receive_window_available: u64,
     /// Configured per-stream receive window.
     pub stream_receive_window: u64,
-    /// Lowest advertised-but-unconsumed credit among open receive streams.
-    pub stream_receive_window_available: Option<u64>,
 }
 
 /// Connection statistics

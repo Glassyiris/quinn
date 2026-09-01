@@ -412,6 +412,7 @@ impl Connection {
     pub fn streams(&mut self) -> Streams<'_> {
         Streams {
             state: &mut self.streams,
+            pending: &mut self.spaces[SpaceId::Data].pending,
             conn_state: &self.state,
         }
     }
@@ -2875,6 +2876,9 @@ impl Connection {
                         stream = %id,
                         offset, "peer claims to be blocked at stream level"
                     );
+                    self.streams.validate_receive_id(id)?;
+                    self.streams
+                        .queue_stream_receive_window(id, &mut self.spaces[SpaceId::Data].pending);
                 }
                 Frame::StreamsBlocked { dir, limit } => {
                     if limit > MAX_STREAM_COUNT {

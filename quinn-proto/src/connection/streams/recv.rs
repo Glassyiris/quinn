@@ -110,7 +110,7 @@ impl Recv {
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
     pub(super) fn max_stream_data(&self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
-        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+        let max_stream_data = self.max_stream_data_limit(stream_receive_window);
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_STREAM_DATA frame.
@@ -137,7 +137,14 @@ impl Recv {
 
     pub(super) fn max_stream_data_increases(&self, stream_receive_window: u64) -> bool {
         self.can_send_flow_control()
-            && self.assembler.bytes_read() + stream_receive_window > self.sent_max_stream_data
+            && self.max_stream_data_limit(stream_receive_window) > self.sent_max_stream_data
+    }
+
+    fn max_stream_data_limit(&self, stream_receive_window: u64) -> u64 {
+        self.assembler
+            .bytes_read()
+            .saturating_add(stream_receive_window)
+            .min(u64::from(VarInt::MAX))
     }
     pub(super) fn needs_initial_window_update(
         &self,
@@ -164,11 +171,6 @@ impl Recv {
         // Stream-level flow control is redundant if the sender has already sent the whole stream,
         // and moot if we no longer want data on this stream.
         self.final_offset_unknown() && !self.stopped
-    }
-
-    pub(super) fn flow_control_available(&self) -> Option<u64> {
-        self.can_send_flow_control()
-            .then(|| self.sent_max_stream_data.saturating_sub(self.end))
     }
 
     /// Whether data is still being accepted from the peer
@@ -395,6 +397,7 @@ impl<'a> Chunks<'a> {
         }
 
         // Issue connection-level flow control credit for any data we read regardless of state
+        self.streams.data_read = self.streams.data_read.saturating_add(self.read);
         let max_data = self.streams.add_read_credits(self.read);
         self.pending.max_data |= max_data.0;
         should_transmit |= max_data.0;
@@ -561,6 +564,19 @@ mod tests {
         assert_eq!(
             max_stream_data, RECV_WINDOW,
             "stream flow control credit isn't issued after stop"
+        );
+    }
+
+    #[test]
+    fn max_stream_data_stays_within_varint() {
+        let mut recv = Recv::new(1);
+        recv.assembler
+            .insert(0, Bytes::from_static(&[0]), 1)
+            .unwrap();
+        assert!(recv.assembler.read(1, true).is_some());
+        assert_eq!(
+            recv.max_stream_data(u64::from(VarInt::MAX)).0,
+            u64::from(VarInt::MAX)
         );
     }
 }

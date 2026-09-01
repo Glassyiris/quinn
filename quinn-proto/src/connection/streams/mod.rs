@@ -30,14 +30,23 @@ pub use state::StreamsState;
 /// Access to streams
 pub struct Streams<'a> {
     pub(super) state: &'a mut StreamsState,
+    pub(super) pending: &'a mut Retransmits,
     pub(super) conn_state: &'a super::State,
 }
 
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> Streams<'a> {
     #[cfg(fuzzing)]
-    pub fn new(state: &'a mut StreamsState, conn_state: &'a super::State) -> Self {
-        Self { state, conn_state }
+    pub fn new(
+        state: &'a mut StreamsState,
+        pending: &'a mut Retransmits,
+        conn_state: &'a super::State,
+    ) -> Self {
+        Self {
+            state,
+            pending,
+            conn_state,
+        }
     }
 
     /// Open a single stream if possible
@@ -56,6 +65,9 @@ impl<'a> Streams<'a> {
         self.state.next[dir as usize] += 1;
         let id = StreamId::new(self.state.side, dir, self.state.next[dir as usize] - 1);
         self.state.insert(false, id);
+        if dir == Dir::Bi {
+            self.state.queue_stream_receive_window(id, self.pending);
+        }
         self.state.send_streams += 1;
         Some(id)
     }
