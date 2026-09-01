@@ -145,6 +145,11 @@ pub struct PathStats {
     /// This is a delivery-progress counter, unlike `FrameStats::acks`, which
     /// counts every ACK frame including duplicate ACK ranges.
     pub acked_packets: u64,
+    /// Number of newly acknowledged packets that elicited an ACK.
+    ///
+    /// ACK-only packets are excluded, so this can be used to detect progress
+    /// for an outbound data path rather than merely reverse-path activity.
+    pub acked_ack_eliciting_packets: u64,
     /// The amount of packets lost on this path
     pub lost_packets: u64,
     /// The amount of bytes lost on this path

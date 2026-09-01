@@ -1475,6 +1475,7 @@ impl Connection {
             .saturating_add(newly_acked_count);
 
         let mut ack_eliciting_acked = false;
+        let mut ack_eliciting_acked_count = 0u64;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
                 if let Some(acked) = info.largest_acked {
@@ -1484,6 +1485,9 @@ impl Connection {
                     // discussion at
                     // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
                     self.spaces[space].pending_acks.subtract_below(acked);
+                }
+                if info.ack_eliciting {
+                    ack_eliciting_acked_count = ack_eliciting_acked_count.saturating_add(1);
                 }
                 ack_eliciting_acked |= info.ack_eliciting;
 
@@ -1501,6 +1505,11 @@ impl Connection {
                 self.on_packet_acked(now, info);
             }
         }
+        self.stats.path.acked_ack_eliciting_packets = self
+            .stats
+            .path
+            .acked_ack_eliciting_packets
+            .saturating_add(ack_eliciting_acked_count);
 
         self.path.congestion.on_end_acks(
             now,
