@@ -152,8 +152,10 @@ impl Endpoint {
         let driver = EndpointDriver(rc.clone());
         runtime.spawn(Box::pin(
             async {
+                // Connections observe the loss through their own errors, and
+                // honk retires probe/warm endpoints this way routinely.
                 if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {}", e);
+                    tracing::debug!("endpoint driver I/O error: {}", e);
                 }
             }
             .instrument(Span::current()),
