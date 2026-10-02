@@ -15,7 +15,7 @@ use super::{
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
-    connection::stats::FrameStats,
+    connection::stats::{FlowControlStats, FrameStats},
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
 };
@@ -121,6 +121,10 @@ pub struct StreamsState {
     pub(super) data_sent: u64,
     /// Sum of end offsets of all receive streams. Includes gaps, so it's an upper bound.
     data_recvd: u64,
+    /// Stream bytes delivered to the application.
+    pub(super) data_read: u64,
+    /// Stream bytes acknowledged by the peer.
+    data_acked: u64,
     /// Total quantity of outgoing data retained in send buffers, including acknowledged data
     pub(super) buffered_data: u64,
     /// Configured upper bound for `buffered_data`.
@@ -129,6 +133,8 @@ pub struct StreamsState {
     pub(super) send_window: u64,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
+    /// Stream receive window advertised in the transport parameters.
+    pub(super) initial_stream_receive_window: u64,
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -180,9 +186,12 @@ impl StreamsState {
             sent_max_data: receive_window,
             data_sent: 0,
             data_recvd: 0,
+            data_read: 0,
+            data_acked: 0,
             buffered_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
+            initial_stream_receive_window: stream_receive_window.into(),
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
@@ -243,6 +252,7 @@ impl StreamsState {
         self.send_streams = 0;
         self.data_sent = 0;
         self.buffered_data = 0;
+        self.data_acked = 0;
         self.connection_blocked.clear();
         self.data_blocked_limit = None;
     }
@@ -255,6 +265,24 @@ impl StreamsState {
         frame: frame::Stream,
         payload_len: usize,
     ) -> Result<ShouldTransmit, TransportError> {
+        self.received_inner(frame, payload_len, None)
+    }
+
+    pub(crate) fn received_and_queue(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+        pending: &mut Retransmits,
+    ) -> Result<ShouldTransmit, TransportError> {
+        self.received_inner(frame, payload_len, Some(pending))
+    }
+
+    fn received_inner(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+        pending: Option<&mut Retransmits>,
+    ) -> Result<ShouldTransmit, TransportError> {
         let id = frame.id;
         self.validate_receive_id(id).inspect_err(|_| {
             debug!("received illegal STREAM frame");
@@ -265,11 +293,18 @@ impl StreamsState {
         let Some(rs) = self
             .recv
             .get_mut(&id)
-            .map(|opt| get_or_insert_recv(opt, self.stream_receive_window))
+            .map(|opt| get_or_insert_recv(opt, self.initial_stream_receive_window))
         else {
             trace!("dropping frame for closed stream");
             return Ok(ShouldTransmit(false));
         };
+        if self.stream_receive_window > self.initial_stream_receive_window
+            && rs.max_stream_data_increases(self.stream_receive_window)
+        {
+            if let Some(pending) = pending {
+                pending.max_stream_data.insert(id);
+            }
+        }
 
         if !rs.is_receiving() {
             trace!("dropping frame for finished stream");
@@ -317,7 +352,7 @@ impl StreamsState {
         let Some(rs) = self
             .recv
             .get_mut(&id)
-            .map(|opt| get_or_insert_recv(opt, self.stream_receive_window))
+            .map(|opt| get_or_insert_recv(opt, self.initial_stream_receive_window))
         else {
             trace!("received RESET_STREAM on closed stream");
             return Ok(ShouldTransmit(false));
@@ -700,6 +735,9 @@ impl StreamsState {
             return;
         }
         let id = frame.id;
+        self.data_acked = self
+            .data_acked
+            .saturating_add(frame.offsets.end - frame.offsets.start);
         let buffered = stream.pending.buffered();
         let finished = stream.ack(frame);
         self.buffered_data -= buffered - stream.pending.buffered();
@@ -871,7 +909,10 @@ impl StreamsState {
     }
 
     /// Check for errors entailed by the peer's use of `id` as a send stream
-    fn validate_receive_id(&mut self, id: StreamId) -> Result<(), TransportError> {
+    pub(in crate::connection) fn validate_receive_id(
+        &mut self,
+        id: StreamId,
+    ) -> Result<(), TransportError> {
         if self.side == id.initiator() {
             match id.dir() {
                 Dir::Uni => {
@@ -930,6 +971,64 @@ impl StreamsState {
         }
         self.receive_window = receive_window;
         expanded
+    }
+
+    pub(crate) fn set_stream_receive_window(
+        &mut self,
+        stream_receive_window: VarInt,
+        pending: &mut Retransmits,
+    ) {
+        let stream_receive_window = stream_receive_window.into();
+        let expanded = stream_receive_window > self.stream_receive_window;
+        self.stream_receive_window = stream_receive_window;
+        if !expanded {
+            return;
+        }
+
+        let side = self.side;
+        let next_remote = self.next_remote;
+        let initial_window = self.initial_stream_receive_window;
+        pending
+            .max_stream_data
+            .extend(self.recv.iter_mut().filter_map(|(&id, stream)| {
+                let open = id.initiator() == side || id.index() < next_remote[id.dir() as usize];
+                if !open {
+                    return None;
+                }
+                get_or_insert_recv(stream, initial_window)
+                    .max_stream_data_increases(stream_receive_window)
+                    .then_some(id)
+            }));
+    }
+
+    pub(crate) fn queue_stream_receive_window(&mut self, id: StreamId, pending: &mut Retransmits) {
+        if self.stream_receive_window <= self.initial_stream_receive_window {
+            return;
+        }
+        // Remote slots are allocated lazily; a blocked peer implicitly opens the stream
+        self.insert_remote(id);
+        let Some(stream) = self.recv.get_mut(&id) else {
+            return;
+        };
+        let stream = get_or_insert_recv(stream, self.initial_stream_receive_window);
+        if stream.needs_initial_window_update(
+            self.initial_stream_receive_window,
+            self.stream_receive_window,
+        ) {
+            pending.max_stream_data.insert(id);
+        }
+    }
+
+    pub(crate) fn flow_control_stats(&self) -> FlowControlStats {
+        FlowControlStats {
+            received_bytes: self.data_read,
+            sent_bytes: self.data_acked,
+            send_window: self.send_window,
+            send_window_available: self.send_window.saturating_sub(self.buffered_data),
+            receive_window: self.receive_window,
+            receive_window_available: u64::from(self.sent_max_data).saturating_sub(self.data_recvd),
+            stream_receive_window: self.stream_receive_window,
+        }
     }
 
     /// Allocate state for a locally-initiated stream
@@ -1018,7 +1117,8 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.free_recv
+            .push(recv.free(self.initial_stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1078,6 +1178,7 @@ mod tests {
         let (mut pending, state) = (Retransmits::default(), ConnState::Established);
         let id = Streams {
             state: &mut server,
+            pending: &mut pending,
             conn_state: &state,
         }
         .open(Dir::Uni)
@@ -1145,6 +1246,7 @@ mod tests {
         let (mut pending, state) = (Retransmits::default(), ConnState::Established);
         let id = Streams {
             state: &mut server,
+            pending: &mut pending,
             conn_state: &state,
         }
         .open(Dir::Uni)
@@ -1281,6 +1383,7 @@ mod tests {
         chunks.next(1024).unwrap();
         let _ = chunks.finalize();
         assert_eq!(client.local_max_data - initial_max, 1024);
+        assert_eq!(client.flow_control_stats().received_bytes, 1024);
         assert_eq!(
             client
                 .received_reset(frame::ResetStream {
@@ -1294,6 +1397,7 @@ mod tests {
 
         assert_eq!(client.data_recvd, 4096);
         assert_eq!(client.local_max_data - initial_max, 4096);
+        assert_eq!(client.flow_control_stats().received_bytes, 1024);
 
         // Ensure reading after a reset doesn't issue redundant credit
         let mut recv = RecvStream {
@@ -1498,6 +1602,7 @@ mod tests {
         let (mut pending, state) = (Retransmits::default(), ConnState::Established);
         let id = Streams {
             state: &mut server,
+            pending: &mut pending,
             conn_state: &state,
         }
         .open(Dir::Uni)
@@ -1559,6 +1664,7 @@ mod tests {
         let (mut pending, state) = (Retransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
+            pending: &mut pending,
             conn_state: &state,
         };
 
@@ -1615,6 +1721,7 @@ mod tests {
         let (mut pending, state) = (Retransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
+            pending: &mut pending,
             conn_state: &state,
         };
 
@@ -1683,6 +1790,7 @@ mod tests {
             let (mut pending, state) = (Retransmits::default(), ConnState::Established);
             let mut streams = Streams {
                 state: &mut server,
+                pending: &mut pending,
                 conn_state: &state,
             };
 
@@ -1763,6 +1871,7 @@ mod tests {
         let (mut pending, state) = (Retransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
+            pending: &mut pending,
             conn_state: &state,
         };
 
@@ -1867,6 +1976,7 @@ mod tests {
         let (mut pending, state) = (Retransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
+            pending: &mut pending,
             conn_state: &state,
         };
 
@@ -1879,6 +1989,7 @@ mod tests {
         };
         stream.write(b"hello").unwrap();
         stream.reset(0u32.into()).unwrap();
+        assert_eq!(stream.state.flow_control_stats().sent_bytes, 0);
 
         assert_eq!(pending.reset_stream, &[(id, 0u32.into())]);
         assert!(!server.can_send_stream_data());
@@ -2226,10 +2337,51 @@ mod tests {
     }
 
     #[test]
+    fn flow_control_stats_track_available_credit() {
+        let mut client = make(Side::Client);
+        let window = client.receive_window;
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+        let mut pending = Retransmits::default();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            assert_eq!(chunks.next(usize::MAX).unwrap().unwrap().bytes.len(), 100);
+        }
+        client.data_sent = 200;
+        client.data_acked = 100;
+        client.buffered_data = 100;
+
+        let stats = client.flow_control_stats();
+        assert_eq!(stats.received_bytes, 100);
+        assert_eq!(stats.sent_bytes, 100);
+        assert_eq!(stats.send_window, 1024 * 1024);
+        assert_eq!(stats.send_window_available, 1024 * 1024 - 100);
+        assert_eq!(stats.receive_window, window);
+        assert_eq!(stats.receive_window_available, window - 100);
+        assert_eq!(stats.stream_receive_window, window);
+    }
+
+    #[test]
     fn expand_receive_window() {
         let mut server = make(Side::Server);
         let new_receive_window = 2 * server.receive_window as u32;
         let expanded = server.set_receive_window(new_receive_window.into());
+
         assert!(expanded);
         assert_eq!(server.receive_window, new_receive_window as u64);
         assert_eq!(server.local_max_data, new_receive_window as u64);
@@ -2242,6 +2394,162 @@ mod tests {
         assert_eq!(server.receive_window_shrink_debt, 0);
         assert_eq!(server.local_max_data, prev_local_max_data + credits);
         assert!(should_transmit.should_transmit());
+    }
+
+    #[test]
+    fn runtime_stream_receive_window_queues_active_and_future_streams() {
+        let mut client = make(Side::Client);
+        let old_window = client.stream_receive_window;
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+
+        let mut pending = Retransmits::default();
+        client.set_stream_receive_window(VarInt::try_from(old_window * 2).unwrap(), &mut pending);
+        assert_eq!(client.stream_receive_window, old_window * 2);
+        assert!(pending.max_stream_data.contains(&id));
+
+        pending.max_stream_data.clear();
+        client.set_stream_receive_window(VarInt::try_from(old_window / 2).unwrap(), &mut pending);
+        assert_eq!(client.stream_receive_window, old_window / 2);
+        assert!(pending.max_stream_data.is_empty());
+        let recv = client
+            .recv
+            .get_mut(&id)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .as_open_recv_mut()
+            .unwrap();
+        assert!(!recv.max_stream_data(old_window / 2).1.should_transmit());
+
+        let mut future_client = make(Side::Client);
+        future_client.set_params(&TransportParameters {
+            initial_max_streams_bidi: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let mut future_pending = Retransmits::default();
+        future_client.set_stream_receive_window(
+            VarInt::try_from(old_window * 2).unwrap(),
+            &mut future_pending,
+        );
+        assert!(future_pending.max_stream_data.is_empty());
+        let state = ConnState::Established;
+        let local_id = Streams {
+            state: &mut future_client,
+            pending: &mut future_pending,
+            conn_state: &state,
+        }
+        .open(Dir::Bi)
+        .unwrap();
+        assert!(future_pending.max_stream_data.remove(&local_id));
+        future_client.validate_receive_id(id).unwrap();
+        future_client.queue_stream_receive_window(id, &mut future_pending);
+        assert!(future_pending.max_stream_data.remove(&id));
+        let _ = future_client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+        future_client.queue_stream_receive_window(id, &mut future_pending);
+        assert!(future_pending.max_stream_data.contains(&id));
+
+        {
+            let recv = future_client
+                .recv
+                .get_mut(&id)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .as_open_recv_mut()
+                .unwrap();
+            let (advertised, _) = recv.max_stream_data(old_window * 2);
+            recv.record_sent_max_stream_data(advertised);
+        }
+        future_pending.max_stream_data.clear();
+        let mut read_pending = Retransmits::default();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut future_client,
+                pending: &mut read_pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            assert_eq!(chunks.next(1).unwrap().unwrap().bytes.len(), 1);
+            assert!(!chunks.finalize().should_transmit());
+        }
+        let _ = future_client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 100,
+                    fin: false,
+                    data: Bytes::from_static(&[0]),
+                },
+                1,
+            )
+            .unwrap();
+        future_client.queue_stream_receive_window(id, &mut future_pending);
+        assert!(future_pending.max_stream_data.is_empty());
+    }
+
+    #[test]
+    fn runtime_stream_receive_window_credits_unmaterialized_open_streams() {
+        let mut client = make(Side::Client);
+        let old_window = client.stream_receive_window;
+        client.set_params(&TransportParameters {
+            initial_max_streams_bidi: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let mut pending = Retransmits::default();
+        let state = ConnState::Established;
+        let local_id = Streams {
+            state: &mut client,
+            pending: &mut pending,
+            conn_state: &state,
+        }
+        .open(Dir::Bi)
+        .unwrap();
+        let remote_id = StreamId::new(Side::Server, Dir::Bi, 0);
+        let unopened_remote_id = StreamId::new(Side::Server, Dir::Bi, 1);
+        client.received_max_stream_data(remote_id, 1).unwrap();
+        assert!(client.recv[&local_id].is_none());
+        assert!(client.recv[&remote_id].is_none());
+
+        client.set_stream_receive_window(VarInt::try_from(old_window * 2).unwrap(), &mut pending);
+
+        assert!(pending.max_stream_data.remove(&local_id));
+        assert!(pending.max_stream_data.remove(&remote_id));
+        assert!(!pending.max_stream_data.contains(&unopened_remote_id));
+        assert!(
+            client.recv[&local_id]
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .is_some()
+        );
+        assert!(
+            client.recv[&remote_id]
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .is_some()
+        );
     }
 
     #[test]
@@ -2314,6 +2622,7 @@ mod tests {
 
         let stream_id = Streams {
             state: &mut server,
+            pending: &mut retransmits,
             conn_state: &conn_state,
         }
         .open(Dir::Uni)
@@ -2354,6 +2663,10 @@ mod tests {
             offsets: 0..larger_send_window,
             fin: false,
         });
+        assert_eq!(
+            stream.state.flow_control_stats().sent_bytes,
+            larger_send_window
+        );
 
         assert_eq!(
             stream.state.poll(),
@@ -2389,6 +2702,7 @@ mod tests {
 
         let stream_id = Streams {
             state: &mut server,
+            pending: &mut retransmits,
             conn_state: &conn_state,
         }
         .open(Dir::Uni)

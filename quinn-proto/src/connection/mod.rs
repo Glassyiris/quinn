@@ -76,7 +76,7 @@ use spaces::Retransmits;
 use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{ConnectionStats, FlowControlStats, FrameStats, PathStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -426,6 +426,7 @@ impl Connection {
     pub fn streams(&mut self) -> Streams<'_> {
         Streams {
             state: &mut self.streams,
+            pending: &mut self.spaces[SpaceId::Data].pending,
             conn_state: &self.state,
         }
     }
@@ -1322,6 +1323,7 @@ impl Connection {
         stats.path.cwnd = self.path.congestion.window();
         stats.path.bandwidth_estimate = self.path.congestion.metrics().bandwidth_estimate;
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        stats.flow_control = self.streams.flow_control_stats();
 
         stats
     }
@@ -1490,6 +1492,15 @@ impl Connection {
         }
     }
 
+    /// See [`TransportConfig::stream_receive_window()`]. Increasing this queues credit for open
+    /// streams; reducing it cannot retract credit already advertised to the peer.
+    pub fn set_stream_receive_window(&mut self, stream_receive_window: VarInt) {
+        self.streams.set_stream_receive_window(
+            stream_receive_window,
+            &mut self.spaces[SpaceId::Data].pending,
+        );
+    }
+
     fn on_ack_received(
         &mut self,
         now: Instant,
@@ -1532,8 +1543,16 @@ impl Connection {
         if newly_acked.is_empty() {
             return Ok(());
         }
+        let newly_acked_count = Self::acked_packet_count(&newly_acked);
+
+        self.stats.path.acked_packets = self
+            .stats
+            .path
+            .acked_packets
+            .saturating_add(newly_acked_count);
 
         let mut ack_eliciting_acked = false;
+        let mut ack_eliciting_acked_count = 0u64;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
                 if let Some(acked) = info.largest_acked {
@@ -1543,6 +1562,9 @@ impl Connection {
                     // discussion at
                     // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
                     self.spaces[space].pending_acks.subtract_below(acked);
+                }
+                if info.ack_eliciting {
+                    ack_eliciting_acked_count = ack_eliciting_acked_count.saturating_add(1);
                 }
                 ack_eliciting_acked |= info.ack_eliciting;
 
@@ -1560,6 +1582,11 @@ impl Connection {
                 self.on_packet_acked(now, info);
             }
         }
+        self.stats.path.acked_ack_eliciting_packets = self
+            .stats
+            .path
+            .acked_ack_eliciting_packets
+            .saturating_add(ack_eliciting_acked_count);
 
         self.path.congestion.on_end_acks(
             now,
@@ -1649,6 +1676,12 @@ impl Connection {
 
         let lost_packets = &mut self.spaces[space].lost_packets;
         lost_packets.retain(|_pn, info| now.saturating_duration_since(info.time_sent) <= two_pto);
+    }
+
+    fn acked_packet_count(ranges: &ArrayRangeSet) -> u64 {
+        ranges.iter().fold(0u64, |count, range| {
+            count.saturating_add(range.end.saturating_sub(range.start))
+        })
     }
 
     /// Process a new ECN block from an in-order ACK
@@ -2951,8 +2984,13 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
-                    if self.streams.received(frame, payload_len)?.should_transmit() {
-                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    let pending = &mut self.spaces[SpaceId::Data].pending;
+                    if self
+                        .streams
+                        .received_and_queue(frame, payload_len, pending)?
+                        .should_transmit()
+                    {
+                        pending.max_data = true;
                     }
                 }
                 Frame::Ack(ack) => {
@@ -3015,6 +3053,9 @@ impl Connection {
                         stream = %id,
                         offset, "peer claims to be blocked at stream level"
                     );
+                    self.streams.validate_receive_id(id)?;
+                    self.streams
+                        .queue_stream_receive_window(id, &mut self.spaces[SpaceId::Data].pending);
                 }
                 Frame::StreamsBlocked { dir, limit } => {
                     if limit > MAX_STREAM_COUNT {
@@ -4410,5 +4451,13 @@ mod tests {
             assert_eq!(negotiate_max_idle_timeout(left, right), result);
             assert_eq!(negotiate_max_idle_timeout(right, left), result);
         }
+    }
+    #[test]
+    fn acked_packet_count_counts_elements_not_ranges() {
+        let mut ranges = ArrayRangeSet::new();
+        ranges.insert(10..13);
+        ranges.insert(20..22);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(Connection::acked_packet_count(&ranges), 5);
     }
 }

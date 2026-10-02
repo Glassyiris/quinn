@@ -44,21 +44,21 @@ fuzz_target!(|input: (StreamParams, Vec<Operation>)| {
     for operation in operations {
         match operation {
             Operation::Open => {
-                Streams::new(&mut state, &conn_state).open(params.dir);
+                Streams::new(&mut state, &mut pending, &conn_state).open(params.dir);
             }
             Operation::Accept(dir) => {
-                Streams::new(&mut state, &conn_state).accept(dir);
+                Streams::new(&mut state, &mut pending, &conn_state).accept(dir);
             }
             Operation::Finish(id) => {
                 let _ = SendStream::new(id, &mut state, &mut pending, &conn_state).finish();
             }
             Operation::ReceivedStopSending(sid, err_code) => {
-                Streams::new(&mut state, &conn_state)
+                Streams::new(&mut state, &mut pending, &conn_state)
                     .state()
                     .received_stop_sending(sid, err_code);
             }
             Operation::ReceivedReset(rs) => {
-                let _ = Streams::new(&mut state, &conn_state)
+                let _ = Streams::new(&mut state, &mut pending, &conn_state)
                     .state()
                     .received_reset(rs);
             }

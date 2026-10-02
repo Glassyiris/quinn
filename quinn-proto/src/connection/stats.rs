@@ -148,12 +148,24 @@ pub struct PathStats {
     pub congestion_events: u64,
     /// Spurious congestion events on the connection
     pub spurious_congestion_events: u64,
+    /// Number of sent packets newly acknowledged by the peer
+    ///
+    /// This is a delivery-progress counter, unlike `FrameStats::acks`, which
+    /// counts every ACK frame including duplicate ACK ranges.
+    pub acked_packets: u64,
+    /// Number of newly acknowledged packets that elicited an ACK.
+    ///
+    /// ACK-only packets are excluded, so this can be used to detect progress
+    /// for an outbound data path rather than merely reverse-path activity.
+    pub acked_ack_eliciting_packets: u64,
     /// The amount of packets lost on this path
     pub lost_packets: u64,
     /// The amount of bytes lost on this path
     pub lost_bytes: u64,
     /// The amount of packets sent on this path
     pub sent_packets: u64,
+    /// The number of packets sent that require an acknowledgement.
+    pub sent_ack_eliciting_packets: u64,
     /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)
     pub sent_plpmtud_probes: u64,
     /// The amount of PLPMTUD probe packets lost on this path (ignored by `lost_packets` and
@@ -163,6 +175,26 @@ pub struct PathStats {
     pub black_holes_detected: u64,
     /// Largest UDP payload size the path currently supports
     pub current_mtu: u16,
+}
+
+/// Stream flow-control state.
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct FlowControlStats {
+    /// Stream bytes delivered to the application.
+    pub received_bytes: u64,
+    /// Stream bytes acknowledged by the peer.
+    pub sent_bytes: u64,
+    /// Configured cap on unacknowledged stream bytes.
+    pub send_window: u64,
+    /// Send-window capacity not currently occupied by unacknowledged stream bytes.
+    pub send_window_available: u64,
+    /// Configured connection-level receive window.
+    pub receive_window: u64,
+    /// Connection-level credit currently advertised but not yet consumed.
+    pub receive_window_available: u64,
+    /// Configured per-stream receive window.
+    pub stream_receive_window: u64,
 }
 
 /// Connection statistics
@@ -179,4 +211,6 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// Receive-side flow-control state
+    pub flow_control: FlowControlStats,
 }

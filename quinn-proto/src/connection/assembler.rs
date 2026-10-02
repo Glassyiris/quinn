@@ -382,7 +382,7 @@ fn insert_ordered(data: &mut VecDeque<Buffer>, buffer: Buffer) {
 ///
 /// Independent of how much memory those spans over-allocate. A frame is rejected only
 /// if compaction cannot get the count back down to this.
-const MAX_CHUNKS: usize = 1024;
+const MAX_CHUNKS: usize = 16384;
 
 /// Minimum size of a defragmented chunk that is retained without coalescing.
 ///
