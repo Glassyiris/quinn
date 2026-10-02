@@ -1,0 +1,36 @@
+# Keeps the `honk` branch (upstream 0.11.x + Honk patches) current.
+# Lives on the default branch because scheduled workflows only run from there.
+name: honk-sync
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: honk-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: honk
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # A conflict or failing test fails the job and leaves `honk` untouched.
+      - name: Merge upstream 0.11.x, test, push
+        run: |
+          set -euo pipefail
+          git fetch https://github.com/quinn-rs/quinn 0.11.x
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "honk already contains upstream 0.11.x"
+            exit 0
+          fi
+          git -c user.name=honk-sync -c user.email=honk-sync@users.noreply.github.com \
+            merge --no-edit FETCH_HEAD
+          cargo test -p quinn-proto -p quinn
+          git push origin HEAD:honk
