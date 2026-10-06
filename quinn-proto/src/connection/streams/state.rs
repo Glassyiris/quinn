@@ -1022,13 +1022,16 @@ impl StreamsState {
         if self.receive_window_autotune_max <= self.receive_window {
             return None;
         }
-        let (start, offset) = *self.autotune_epoch.get_or_insert((now, self.credited));
-        let read = self.credited - offset;
-        if read == 0 {
-            // Idle: the epoch starts when data does.
+        if self.autotune_epoch.is_none() {
+            // The first epoch starts with the first received data, as in quic-go. Later epochs
+            // restart only when evaluated, so time spent not reading counts against growth.
+            if self.data_recvd == 0 {
+                return None;
+            }
             self.autotune_epoch = Some((now, self.credited));
-            return None;
         }
+        let (start, offset) = self.autotune_epoch?;
+        let read = self.credited - offset;
         if read <= self.receive_window / 2 || rtt.is_zero() {
             return None;
         }

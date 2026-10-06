@@ -4429,7 +4429,11 @@ fn autotune_round(
     let msg = vec![0xAB; window];
     assert_eq!(pair.client_send(client_ch, s).write(&msg), Ok(window));
     pair.drive();
-    pair.time += reader_delay;
+    // A stalled reader still lets the connection poll for transmissions meanwhile.
+    for _ in 0..reader_delay.as_secs() {
+        pair.time += Duration::from_secs(1);
+        pair.drive_server();
+    }
     let mut read = 0;
     let mut recv = pair.server_recv(server_ch, s);
     let mut chunks = recv.read(true).unwrap();
