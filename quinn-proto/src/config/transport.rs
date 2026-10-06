@@ -30,6 +30,7 @@ pub struct TransportConfig {
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
+    pub(crate) receive_window_autotune_max: Option<VarInt>,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
 
@@ -124,6 +125,19 @@ impl TransportConfig {
     /// stream while another is blocked.
     pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
         self.receive_window = value;
+        self
+    }
+
+    /// Upper bound for automatic growth of the connection receive window.
+    ///
+    /// Starting from `receive_window`, the window doubles whenever the application drains more
+    /// than half of it faster than four round trips per window, so it settles between four and
+    /// eight times the delivery rate multiplied by the RTT, and it never shrinks. Because the
+    /// trigger is bytes read by the application, a slow reader does not grow the window. `None`
+    /// (the default) keeps the window fixed. A value not above `receive_window` also keeps it
+    /// fixed.
+    pub fn receive_window_autotune(&mut self, max: Option<VarInt>) -> &mut Self {
+        self.receive_window_autotune_max = max;
         self
     }
 
@@ -376,6 +390,7 @@ impl Default for TransportConfig {
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
+            receive_window_autotune_max: None,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
 
@@ -414,6 +429,7 @@ impl fmt::Debug for TransportConfig {
             max_idle_timeout,
             stream_receive_window,
             receive_window,
+            receive_window_autotune_max,
             send_window,
             send_fairness,
             packet_threshold,
@@ -443,6 +459,7 @@ impl fmt::Debug for TransportConfig {
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
+            .field("receive_window_autotune_max", receive_window_autotune_max)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)

@@ -4411,3 +4411,93 @@ fn preferred_address() {
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
     pair.connect();
 }
+
+/// Writes one connection window on a fresh stream, optionally lets a slow reader sit on it, then
+/// reads it all and returns the server's receive window.
+fn autotune_round(
+    pair: &mut Pair,
+    ch: (ConnectionHandle, ConnectionHandle),
+    reader_delay: Duration,
+) -> u64 {
+    let (client_ch, server_ch) = ch;
+    let window = pair
+        .server_conn_mut(server_ch)
+        .stats()
+        .flow_control
+        .receive_window as usize;
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let msg = vec![0xAB; window];
+    assert_eq!(pair.client_send(client_ch, s).write(&msg), Ok(window));
+    pair.drive();
+    pair.time += reader_delay;
+    let mut read = 0;
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        read += chunk.bytes.len();
+    }
+    let _ = chunks.finalize();
+    assert_eq!(read, window);
+    pair.drive();
+    pair.server_conn_mut(server_ch)
+        .stats()
+        .flow_control
+        .receive_window
+}
+
+fn autotune_pair() -> (Pair, (ConnectionHandle, ConnectionHandle)) {
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 2000u32.into(),
+            stream_receive_window: 1_000_000u32.into(),
+            receive_window_autotune_max: Some(8000u32.into()),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    pair.latency = Duration::from_millis(50);
+    let ch = pair.connect();
+    (pair, ch)
+}
+
+#[test]
+fn receive_window_doubles_when_drained_quickly_and_stops_at_the_cap() {
+    let _guard = subscribe();
+    let (mut pair, ch) = autotune_pair();
+    let mut windows = Vec::new();
+    for _ in 0..6 {
+        windows.push(autotune_round(&mut pair, ch, Duration::ZERO));
+    }
+    assert_eq!(windows[0], 4000, "{windows:?}");
+    assert_eq!(windows[1], 8000, "{windows:?}");
+    assert!(windows[2..].iter().all(|&w| w == 8000), "{windows:?}");
+}
+
+#[test]
+fn receive_window_does_not_grow_for_a_slow_reader() {
+    let _guard = subscribe();
+    let (mut pair, ch) = autotune_pair();
+    for _ in 0..4 {
+        assert_eq!(autotune_round(&mut pair, ch, Duration::from_secs(10)), 2000);
+    }
+}
+
+#[test]
+fn receive_window_is_fixed_without_autotune() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: 2000u32.into(),
+            stream_receive_window: 1_000_000u32.into(),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    pair.latency = Duration::from_millis(50);
+    let ch = pair.connect();
+    for _ in 0..4 {
+        assert_eq!(autotune_round(&mut pair, ch, Duration::ZERO), 2000);
+    }
+}
