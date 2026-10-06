@@ -276,6 +276,7 @@ impl StreamsState {
     /// Process incoming stream frame
     ///
     /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+    #[cfg(test)]
     pub(crate) fn received(
         &mut self,
         frame: frame::Stream,
