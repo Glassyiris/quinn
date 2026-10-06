@@ -9,8 +9,8 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, error, trace};
 
 use super::{
-    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
-    StreamHalf, ThinRetransmits,
+    PendingStreamsQueue, ReceiveAutotune, Recv, Retransmits, Send, SendState, ShouldTransmit,
+    StreamEvent, StreamHalf, ThinRetransmits,
 };
 use crate::{
     Dir, Duration, Instant, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
@@ -143,12 +143,7 @@ pub struct StreamsState {
 
     /// The shrink to be applied to local_max_data when receive_window is shrunk
     receive_window_shrink_debt: u64,
-    /// Upper bound for receive window auto-tuning; not above `receive_window` disables it
-    receive_window_autotune_max: u64,
-    /// Total connection credit issued to the peer: the application's consumption counter
-    credited: u64,
-    /// Start time and `credited` at the start of the current auto-tuning epoch
-    autotune_epoch: Option<(Instant, u64)>,
+    autotune: ReceiveAutotune,
     /// Value of `max_data` for which a `DATA_BLOCKED` frame was most recently queued
     ///
     /// A new frame is only queued once the peer has raised the limit.
@@ -200,9 +195,7 @@ impl StreamsState {
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
-            receive_window_autotune_max: 0,
-            credited: 0,
-            autotune_epoch: None,
+            autotune: ReceiveAutotune::default(),
             data_blocked_limit: None,
         };
 
@@ -1003,49 +996,34 @@ impl StreamsState {
         expanded
     }
 
-    pub(crate) fn set_receive_window_autotune_max(&mut self, max: u64) {
-        self.receive_window_autotune_max = max;
+    pub(crate) fn set_receive_window_autotune(&mut self, max: Option<VarInt>) {
+        self.autotune.set_max(max);
     }
 
-    /// Doubles the connection receive window when the application consumes it faster than four
-    /// round trips per window, up to the configured maximum
-    ///
-    /// This is the receive-buffer auto-tuning of Chromium and quic-go: once more than half of
-    /// the window was read in an epoch and reading `fraction` of the window took less than
-    /// `4 * fraction * rtt`, the window cannot cover four times the delivery rate times the
-    /// RTT. Growing from bytes read rather than bytes received keeps slow readers from
-    /// inflating it, and the window never shrinks.
+    /// See [`ReceiveAutotune`]
     pub(crate) fn autotune_receive_window(
         &mut self,
         now: Instant,
         rtt: Duration,
     ) -> Option<VarInt> {
-        if self.receive_window_autotune_max <= self.receive_window {
-            return None;
-        }
-        if self.autotune_epoch.is_none() {
-            // The first epoch starts with the first received data, as in quic-go. Later epochs
-            // restart only when evaluated, so time spent not reading counts against growth.
-            if self.data_recvd == 0 {
-                return None;
-            }
-            self.autotune_epoch = Some((now, self.credited));
-        }
-        let (start, offset) = self.autotune_epoch?;
-        let read = self.credited - offset;
-        if read <= self.receive_window / 2 || rtt.is_zero() {
-            return None;
-        }
-        let fraction = read as f64 / self.receive_window as f64;
-        self.autotune_epoch = Some((now, self.credited));
-        if now.saturating_duration_since(start) >= rtt.mul_f64(4.0 * fraction) {
-            return None;
-        }
-        let doubled = self
-            .receive_window
-            .saturating_mul(2)
-            .min(self.receive_window_autotune_max);
-        VarInt::try_from(doubled).ok()
+        self.autotune.next_window(
+            now,
+            rtt,
+            self.receive_window,
+            self.consumed(),
+            self.data_recvd > 0,
+        )
+    }
+
+    /// Bytes the application has read, including data discarded by stopping or resetting streams
+    ///
+    /// `local_max_data` starts at `receive_window`, grows by the same amount as `receive_window`
+    /// when that is raised, and otherwise grows by exactly the credits issued. A shrink leaves it
+    /// above the window by the debt still to be absorbed by later credits.
+    fn consumed(&self) -> u64 {
+        self.local_max_data
+            .saturating_sub(self.receive_window)
+            .saturating_sub(self.receive_window_shrink_debt)
     }
 
     pub(crate) fn set_stream_receive_window(
@@ -1126,7 +1104,6 @@ impl StreamsState {
     /// suppress sending further updates until the window increases significantly
     /// again.
     pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
-        self.credited = self.credited.saturating_add(credits);
         if credits > self.receive_window_shrink_debt {
             let net_credits = credits - self.receive_window_shrink_debt;
             self.local_max_data = self.local_max_data.saturating_add(net_credits);
@@ -2468,6 +2445,31 @@ mod tests {
                 .as_open_recv()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn consumed_tracks_credits_across_window_changes() {
+        let mut server = make(Side::Server);
+        let window = server.receive_window;
+        let mut credited = 0;
+        for (step, credits) in [1000, 1000, 1000, 2000, 1024 * 1024, 4096]
+            .into_iter()
+            .enumerate()
+        {
+            match step {
+                1 => {
+                    server.set_receive_window(VarInt::from_u64(window * 2).unwrap());
+                }
+                3 => {
+                    // Shrinking leaves debt that absorbs the next credits without moving local_max_data
+                    server.set_receive_window(VarInt::from_u64(window / 2).unwrap());
+                }
+                _ => {}
+            }
+            let _ = server.add_read_credits(credits);
+            credited += credits;
+            assert_eq!(server.consumed(), credited, "step {step}");
+        }
     }
 
     #[test]

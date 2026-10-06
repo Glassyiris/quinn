@@ -358,9 +358,7 @@ impl Connection {
                     config.receive_window,
                     config.stream_receive_window,
                 );
-                streams.set_receive_window_autotune_max(
-                    config.receive_window_autotune_max.map_or(0, u64::from),
-                );
+                streams.set_receive_window_autotune(config.receive_window_autotune_max);
                 streams
             },
             datagrams: DatagramState::default(),
