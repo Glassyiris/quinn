@@ -349,14 +349,20 @@ impl Connection {
             receiving_ecn: false,
             total_authed_packets: 0,
 
-            streams: StreamsState::new(
-                side,
-                config.max_concurrent_uni_streams,
-                config.max_concurrent_bidi_streams,
-                config.send_window,
-                config.receive_window,
-                config.stream_receive_window,
-            ),
+            streams: {
+                let mut streams = StreamsState::new(
+                    side,
+                    config.max_concurrent_uni_streams,
+                    config.max_concurrent_bidi_streams,
+                    config.send_window,
+                    config.receive_window,
+                    config.stream_receive_window,
+                );
+                streams.set_receive_window_autotune_max(
+                    config.receive_window_autotune_max.map_or(0, u64::from),
+                );
+                streams
+            },
             datagrams: DatagramState::default(),
             config,
             rem_cids: CidQueue::new(rem_cid),
@@ -469,6 +475,13 @@ impl Connection {
             false => 1,
             true => max_datagrams,
         };
+
+        if let Some(window) = self
+            .streams
+            .autotune_receive_window(now, self.path.rtt.get())
+        {
+            self.set_receive_window(window);
+        }
 
         let mut num_datagrams = 0;
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC

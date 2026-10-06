@@ -13,7 +13,7 @@ use super::{
     StreamHalf, ThinRetransmits,
 };
 use crate::{
-    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
+    Dir, Duration, Instant, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
     connection::stats::{FlowControlStats, FrameStats},
     frame::{self, FrameStruct, StreamMetaVec},
@@ -143,6 +143,12 @@ pub struct StreamsState {
 
     /// The shrink to be applied to local_max_data when receive_window is shrunk
     receive_window_shrink_debt: u64,
+    /// Upper bound for receive window auto-tuning; not above `receive_window` disables it
+    receive_window_autotune_max: u64,
+    /// Total connection credit issued to the peer: the application's consumption counter
+    credited: u64,
+    /// Start time and `credited` at the start of the current auto-tuning epoch
+    autotune_epoch: Option<(Instant, u64)>,
     /// Value of `max_data` for which a `DATA_BLOCKED` frame was most recently queued
     ///
     /// A new frame is only queued once the peer has raised the limit.
@@ -194,6 +200,9 @@ impl StreamsState {
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
+            receive_window_autotune_max: 0,
+            credited: 0,
+            autotune_epoch: None,
             data_blocked_limit: None,
         };
 
@@ -993,6 +1002,51 @@ impl StreamsState {
         expanded
     }
 
+    pub(crate) fn set_receive_window_autotune_max(&mut self, max: u64) {
+        self.receive_window_autotune_max = max;
+    }
+
+    /// Doubles the connection receive window when the application consumes it faster than four
+    /// round trips per window, up to the configured maximum
+    ///
+    /// This is the receive-buffer auto-tuning of Chromium and quic-go: once more than half of
+    /// the window was read in an epoch and reading `fraction` of the window took less than
+    /// `4 * fraction * rtt`, the window cannot cover four times the delivery rate times the
+    /// RTT. Growing from bytes read rather than bytes received keeps slow readers from
+    /// inflating it, and the window never shrinks.
+    pub(crate) fn autotune_receive_window(
+        &mut self,
+        now: Instant,
+        rtt: Duration,
+    ) -> Option<VarInt> {
+        if self.receive_window_autotune_max <= self.receive_window {
+            return None;
+        }
+        if self.autotune_epoch.is_none() {
+            // The first epoch starts with the first received data, as in quic-go. Later epochs
+            // restart only when evaluated, so time spent not reading counts against growth.
+            if self.data_recvd == 0 {
+                return None;
+            }
+            self.autotune_epoch = Some((now, self.credited));
+        }
+        let (start, offset) = self.autotune_epoch?;
+        let read = self.credited - offset;
+        if read <= self.receive_window / 2 || rtt.is_zero() {
+            return None;
+        }
+        let fraction = read as f64 / self.receive_window as f64;
+        self.autotune_epoch = Some((now, self.credited));
+        if now.saturating_duration_since(start) >= rtt.mul_f64(4.0 * fraction) {
+            return None;
+        }
+        let doubled = self
+            .receive_window
+            .saturating_mul(2)
+            .min(self.receive_window_autotune_max);
+        VarInt::try_from(doubled).ok()
+    }
+
     pub(crate) fn set_stream_receive_window(
         &mut self,
         stream_receive_window: VarInt,
@@ -1071,6 +1125,7 @@ impl StreamsState {
     /// suppress sending further updates until the window increases significantly
     /// again.
     pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
+        self.credited = self.credited.saturating_add(credits);
         if credits > self.receive_window_shrink_debt {
             let net_credits = credits - self.receive_window_shrink_debt;
             self.local_max_data = self.local_max_data.saturating_add(net_credits);
