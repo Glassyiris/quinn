@@ -4777,3 +4777,136 @@ fn application_close_in_initial_is_rejected() {
         })
     );
 }
+
+#[test]
+fn congestion_controller_sees_each_packet_once() {
+    use crate::congestion::{Controller, ControllerFactory};
+    use std::{any::Any, collections::BTreeSet, sync::Mutex};
+
+    #[derive(Default)]
+    struct Log {
+        sent: Vec<(SpaceId, u64)>,
+        acked: Vec<(SpaceId, u64)>,
+        lost: Vec<(SpaceId, u64)>,
+        cwnd_limited: u64,
+    }
+
+    struct Recording(Arc<Mutex<Log>>);
+
+    impl Controller for Recording {
+        fn on_packet_sent(&mut self, _: Instant, _: u16, pn: u64, space: SpaceId) {
+            self.0.lock().unwrap().sent.push((space, pn));
+        }
+
+        fn on_packet_acked(
+            &mut self,
+            _: Instant,
+            _: Instant,
+            _: u16,
+            pn: u64,
+            space: SpaceId,
+            _: bool,
+            _: &crate::RttEstimator,
+        ) {
+            self.0.lock().unwrap().acked.push((space, pn));
+        }
+
+        fn on_packet_lost(&mut self, _: Instant, _: u16, pn: u64, space: SpaceId) {
+            self.0.lock().unwrap().lost.push((space, pn));
+        }
+
+        fn on_cwnd_limited(&mut self) {
+            self.0.lock().unwrap().cwnd_limited += 1;
+        }
+
+        fn on_congestion_event(&mut self, _: Instant, _: Instant, _: bool, _: u64) {}
+
+        fn on_mtu_update(&mut self, _: u16) {}
+
+        fn window(&self) -> u64 {
+            16 * 1200
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self(self.0.clone()))
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    struct Factory(Arc<Mutex<Log>>);
+
+    impl ControllerFactory for Factory {
+        fn build(self: Arc<Self>, _: Instant, _: u16) -> Box<dyn Controller> {
+            Box::new(Recording(self.0.clone()))
+        }
+    }
+
+    let _guard = subscribe();
+    let log = Arc::new(Mutex::new(Log::default()));
+    let mut transport = TransportConfig::default();
+    transport
+        .congestion_controller_factory(Arc::new(Factory(log.clone())))
+        .mtu_discovery_config(None);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let data = vec![0; 256 * 1024];
+    let mut written = 0;
+    while written < data.len() {
+        written += pair
+            .client_send(client_ch, s)
+            .write(&data[written..])
+            .unwrap();
+    }
+    pair.drive_client();
+    // Lose two datagrams from the middle of the first window so later ACKs declare them lost
+    let delivered = pair.server.inbound.len();
+    assert!(delivered > 6);
+    pair.server.inbound.remove(3);
+    pair.server.inbound.remove(3);
+    pair.drive();
+
+    let log = log.lock().unwrap();
+    let sent = log.sent.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        sent.len(),
+        log.sent.len(),
+        "a packet was reported sent twice"
+    );
+    for space in [SpaceId::Initial, SpaceId::Data] {
+        assert!(log.sent.iter().any(|&(s, _)| s == space), "{space:?}");
+    }
+    let acked = log.acked.iter().copied().collect::<BTreeSet<_>>();
+    let lost = log.lost.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        acked.len(),
+        log.acked.len(),
+        "a packet was reported acked twice"
+    );
+    assert_eq!(
+        lost.len(),
+        log.lost.len(),
+        "a packet was reported lost twice"
+    );
+    assert!(acked.is_disjoint(&lost));
+    assert!(acked.is_subset(&sent));
+    assert!(lost.iter().all(|&(space, _)| space == SpaceId::Data));
+    assert!(!lost.is_empty());
+    for packet in sent.iter().filter(|&&(space, _)| space == SpaceId::Data) {
+        assert!(
+            acked.contains(packet) || lost.contains(packet),
+            "{packet:?} unresolved"
+        );
+    }
+    assert!(log.cwnd_limited > 0);
+}

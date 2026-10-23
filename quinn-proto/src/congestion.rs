@@ -1,7 +1,7 @@
 //! Logic for controlling the rate at which data is sent
 
-use crate::Instant;
 use crate::connection::RttEstimator;
+use crate::{Instant, SpaceId};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -44,6 +44,44 @@ pub trait Controller: Send + Sync {
         largest_packet_num_acked: Option<u64>,
     ) {
     }
+
+    /// One ack-eliciting packet was just sent
+    ///
+    /// Unlike [`Controller::on_sent`], which summarizes a batch of datagrams, this is called once
+    /// per packet. Packet numbers are only unique within `space`.
+    #[allow(unused_variables)]
+    fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64, space: SpaceId) {}
+
+    /// One ack-eliciting packet was acknowledged
+    ///
+    /// Called alongside [`Controller::on_ack`] for the same packet.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u16,
+        pn: u64,
+        space: SpaceId,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+    }
+
+    /// One packet was declared lost
+    ///
+    /// Called for each lost packet before [`Controller::on_congestion_event`] summarizes the batch.
+    #[allow(unused_variables)]
+    fn on_packet_lost(&mut self, now: Instant, bytes: u16, pn: u64, space: SpaceId) {}
+
+    /// The peer reported ECN congestion marks on packets up to `largest_pn`
+    ///
+    /// Called alongside [`Controller::on_congestion_event`] with zero `lost_bytes`.
+    #[allow(unused_variables)]
+    fn on_ecn_congestion(&mut self, now: Instant, sent: Instant, largest_pn: u64, space: SpaceId) {}
+
+    /// Data was ready to send but the congestion window was full
+    fn on_cwnd_limited(&mut self) {}
 
     /// Packets were deemed lost or marked congested
     ///
