@@ -12,6 +12,9 @@ use tracing::warn;
 /// The bucket refills at a rate slightly faster
 /// than one congestion window per RTT, as recommended in
 /// <https://tools.ietf.org/html/draft-ietf-quic-recovery-34#section-7.7>
+///
+/// A controller that reports its own pacing rate replaces both the capacity and the refill rate;
+/// see [`Self::delay_at_rate`].
 pub(super) struct Pacer {
     capacity: u64,
     last_window: u64,
@@ -376,8 +379,8 @@ mod tests {
             while now < start + Duration::from_secs(1) {
                 match pacer.delay_at_rate(rate, mtu as u64, mtu, now) {
                     None => {
-                        // As `poll_transmit` does with GSO, the second datagram's request
-                        // includes the first, which is debited only once the batch is finished
+                        // As in `poll_transmit` with GSO, the second datagram's request includes
+                        // the first, which is still being built and not yet debited
                         let batch = match pacer.delay_at_rate(rate, 2 * mtu as u64, mtu, now) {
                             None => 2,
                             Some(_) => 1,
