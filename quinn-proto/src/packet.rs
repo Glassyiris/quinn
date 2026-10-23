@@ -882,6 +882,7 @@ const KEY_PHASE_BIT: u8 = 0x04;
 
 /// Packet number space identifiers
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[non_exhaustive]
 pub enum SpaceId {
     /// Unprotected packets, used to bootstrap the handshake
     Initial = 0,
