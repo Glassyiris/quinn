@@ -142,12 +142,13 @@ impl Pacer {
             self.prev = now;
         }
 
-        // A packet larger than the whole bucket must still be released eventually
-        let target = bytes_to_send.min(capacity);
-        if self.tokens >= target {
+        // `bytes_to_send` may include a packet already built for this GSO batch but not yet
+        // debited, so it must not be capped: a lone packet never exceeds `capacity` (at least one
+        // MTU), and a request beyond it ends the batch instead of borrowing credit
+        if self.tokens >= bytes_to_send {
             return None;
         }
-        Some(now + Duration::from_secs_f64((target - self.tokens) as f64 / rate as f64))
+        Some(now + Duration::from_secs_f64((bytes_to_send - self.tokens) as f64 / rate as f64))
     }
 }
 
@@ -367,7 +368,7 @@ mod tests {
         let mtu = 1200;
         // A window this large on a short RTT would let the window-derived pacer send far faster
         let (window, rtt) = (64_000_000, Duration::from_millis(5));
-        for rate in [12_500_000u64, 250_000] {
+        for rate in [12_500_000u64, 250_000, 100_000] {
             let start = Instant::now();
             let mut pacer = Pacer::new(rtt, window, mtu, start);
             let mut now = start;
@@ -375,8 +376,16 @@ mod tests {
             while now < start + Duration::from_secs(1) {
                 match pacer.delay_at_rate(rate, mtu as u64, mtu, now) {
                     None => {
-                        pacer.on_transmit(mtu);
-                        sent += mtu as u64;
+                        // As `poll_transmit` does with GSO, the second datagram's request
+                        // includes the first, which is debited only once the batch is finished
+                        let batch = match pacer.delay_at_rate(rate, 2 * mtu as u64, mtu, now) {
+                            None => 2,
+                            Some(_) => 1,
+                        };
+                        for _ in 0..batch {
+                            pacer.on_transmit(mtu);
+                        }
+                        sent += batch * mtu as u64;
                     }
                     Some(next) => now = next,
                 }
