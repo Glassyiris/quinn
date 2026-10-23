@@ -473,8 +473,8 @@ impl Connection {
             false => 1,
             true => max_datagrams,
         };
-        // Sending does not change the controller's pacing parameters, so one snapshot serves the
-        // whole call
+        // One snapshot per call: a controller may retune pacing as packets are sent (BBRv3 does on
+        // restart from idle), but a stale rate only governs the rest of this batch
         let metrics = self.path.congestion.metrics();
         let max_datagrams = match metrics.send_quantum {
             Some(quantum) => {
