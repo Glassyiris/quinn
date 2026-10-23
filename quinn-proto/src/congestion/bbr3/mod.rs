@@ -1735,7 +1735,10 @@ impl Bbr3 {
         if largest_packet_num_acked.is_some() {
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
+            }
+            // Clearing and renewing are independent: the ACK that ends the previous app-limited
+            // period renews the marker if the sender is still app-limited
+            if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             // Each queue is ordered by packet number and `round_count`, and nearly every packet
@@ -7037,5 +7040,80 @@ mod test {
         // too, leaving only the latest frame's packets awaiting removal
         let tracked = bbr.packets[SpaceId::Data as usize].len();
         assert!(tracked <= 16, "{tracked} packets still tracked");
+    }
+
+    /// A connection that only sends sparse small packets (keepalives, interactive traffic) stays
+    /// application-limited, so those packets must not age the bandwidth model out (noq#852). The
+    /// ACK that clears the app-limited marker has to renew it too, or every other packet counts
+    /// as a bandwidth sample and `max_bw` collapses to the trickle's rate.
+    #[test]
+    fn sparse_app_limited_packets_preserve_max_bw() {
+        const MSS: u64 = 1200;
+        const RTT_NS: u64 = 100_000_000;
+        const PING: u16 = 40;
+        let mut sim = Sim::new(Bbr3Config::default(), MSS, 12_500_000.0, RTT_NS);
+        sim.run(
+            2_000_000,
+            |_| ControlFlow::Continue(()),
+            |bbr, _, _, _| match bbr.full_bw_reached && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
+            },
+        );
+        let max_bw = sim.bbr.max_bw;
+
+        // The application stops, so every ACK from here on reports the sender app-limited
+        let Sim {
+            bbr,
+            base,
+            rtt_est,
+            flight,
+            inflight,
+            mut now_ns,
+            mut pn,
+            mss,
+            ..
+        } = &mut sim;
+        let at = |ns: u64| *base + Duration::from_nanos(ns);
+        while let Some(p) = flight.pop_front() {
+            now_ns = now_ns.max(p.ack_ns);
+            *inflight -= *mss;
+            rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+            bbr.on_ack(
+                at(now_ns),
+                at(p.send_ns),
+                *mss,
+                p.pn,
+                SpaceId::Data,
+                true,
+                rtt_est,
+            );
+            bbr.on_end_acks(at(now_ns), *inflight, true, Some(p.pn), SpaceId::Data);
+        }
+
+        // One small packet per second for half a minute
+        for _ in 0..30 {
+            now_ns += 1_000_000_000;
+            bbr.on_packet_sent(at(now_ns), PING, pn, SpaceId::Data);
+            let sent = now_ns;
+            now_ns += RTT_NS;
+            rtt_est.update(Duration::ZERO, Duration::from_nanos(RTT_NS));
+            bbr.on_ack(
+                at(now_ns),
+                at(sent),
+                PING.into(),
+                pn,
+                SpaceId::Data,
+                true,
+                rtt_est,
+            );
+            bbr.on_end_acks(at(now_ns), 0, true, Some(pn), SpaceId::Data);
+            pn += 1;
+        }
+        assert!(
+            bbr.max_bw >= max_bw,
+            "max_bw fell from {max_bw} to {} over sparse app-limited packets",
+            bbr.max_bw
+        );
     }
 }
