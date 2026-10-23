@@ -4910,3 +4910,81 @@ fn congestion_controller_sees_each_packet_once() {
     }
     assert!(log.cwnd_limited > 0);
 }
+
+#[test]
+fn pacer_follows_controller_rate() {
+    use crate::congestion::{Controller, ControllerFactory, ControllerMetrics};
+    use std::any::Any;
+
+    const RATE: u64 = 1_250_000;
+
+    struct Fixed;
+
+    impl Controller for Fixed {
+        fn on_congestion_event(&mut self, _: Instant, _: Instant, _: bool, _: u64) {}
+
+        fn on_mtu_update(&mut self, _: u16) {}
+
+        fn window(&self) -> u64 {
+            64 * 1024 * 1024
+        }
+
+        fn metrics(&self) -> ControllerMetrics {
+            ControllerMetrics {
+                congestion_window: self.window(),
+                pacer_rate: Some(RATE),
+                ..Default::default()
+            }
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self)
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    struct Factory;
+
+    impl ControllerFactory for Factory {
+        fn build(self: Arc<Self>, _: Instant, _: u16) -> Box<dyn Controller> {
+            Box::new(Fixed)
+        }
+    }
+
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport
+        .congestion_controller_factory(Arc::new(Factory))
+        .mtu_discovery_config(None);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let data = vec![0; 500 * 1024];
+    let mut written = 0;
+    while written < data.len() {
+        written += pair
+            .client_send(client_ch, s)
+            .write(&data[written..])
+            .unwrap();
+    }
+    pair.client_send(client_ch, s).finish().unwrap();
+    let start = pair.time;
+    pair.drive();
+    let elapsed = (pair.time - start).as_secs_f64();
+    let expected = data.len() as f64 / RATE as f64;
+    assert!(
+        elapsed > expected * 0.9 && elapsed < expected * 1.25,
+        "sent {} bytes in {elapsed:.3}s, expected about {expected:.3}s",
+        data.len()
+    );
+}

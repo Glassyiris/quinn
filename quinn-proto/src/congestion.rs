@@ -109,6 +109,8 @@ pub trait Controller: Send + Sync {
             congestion_window: self.window(),
             ssthresh: None,
             pacing_rate: None,
+            pacer_rate: None,
+            send_quantum: None,
         }
     }
 
@@ -130,8 +132,15 @@ pub struct ControllerMetrics {
     pub congestion_window: u64,
     /// Slow start threshold (bytes)
     pub ssthresh: Option<u64>,
-    /// Pacing rate (bits/s)
+    /// Pacing rate (bits/s), reported for diagnostics only
     pub pacing_rate: Option<u64>,
+    /// Rate at which the pacer releases packets (bytes/s)
+    ///
+    /// When set, this replaces the pacing rate the connection would otherwise derive from the
+    /// congestion window and RTT.
+    pub pacer_rate: Option<u64>,
+    /// Upper bound on the bytes sent in one batch of datagrams
+    pub send_quantum: Option<u64>,
 }
 
 /// Constructs controllers on demand

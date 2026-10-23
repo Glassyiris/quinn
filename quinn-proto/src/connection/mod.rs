@@ -473,6 +473,16 @@ impl Connection {
             false => 1,
             true => max_datagrams,
         };
+        // Sending does not change the controller's pacing parameters, so one snapshot serves the
+        // whole call
+        let metrics = self.path.congestion.metrics();
+        let max_datagrams = match metrics.send_quantum {
+            Some(quantum) => {
+                let datagrams = quantum / u64::from(self.path.current_mtu());
+                max_datagrams.min(usize::try_from(datagrams).unwrap_or(usize::MAX).max(1))
+            }
+            None => max_datagrams,
+        };
 
         if let Some(window) = self
             .streams
@@ -643,13 +653,21 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        self.path.congestion.window(),
-                        now,
-                    ) {
+                    let mtu = self.path.current_mtu();
+                    let delay = match metrics.pacer_rate {
+                        Some(rate) => self
+                            .path
+                            .pacing
+                            .delay_at_rate(rate, bytes_to_send, mtu, now),
+                        None => self.path.pacing.delay(
+                            smoothed_rtt,
+                            bytes_to_send,
+                            mtu,
+                            self.path.congestion.window(),
+                            now,
+                        ),
+                    };
+                    if let Some(delay) = delay {
                         self.timers.set(Timer::Pacing, delay);
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
