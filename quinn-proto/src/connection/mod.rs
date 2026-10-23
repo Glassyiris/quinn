@@ -473,6 +473,16 @@ impl Connection {
             false => 1,
             true => max_datagrams,
         };
+        // One snapshot per call: a controller may retune pacing as packets are sent (BBRv3 does on
+        // restart from idle), but a stale rate only governs the rest of this batch
+        let metrics = self.path.congestion.metrics();
+        let max_datagrams = match metrics.send_quantum {
+            Some(quantum) => {
+                let datagrams = quantum / u64::from(self.path.current_mtu());
+                max_datagrams.min(usize::try_from(datagrams).unwrap_or(usize::MAX).max(1))
+            }
+            None => max_datagrams,
+        };
 
         if let Some(window) = self
             .streams
@@ -538,6 +548,7 @@ impl Connection {
         let mut pad_datagram = false;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
+        let mut cwnd_blocked = false;
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -614,8 +625,13 @@ impl Connection {
                 }
 
                 // Congestion control and pacing checks
-                // Tail loss probes must not be blocked by congestion, or a deadlock could arise
-                if ack_eliciting && self.spaces[space_id].loss_probes == 0 {
+                // Tail loss probes must not be blocked by congestion, or a deadlock could arise.
+                // Close packets contain only ACKs and CONNECTION_CLOSE, neither of which is
+                // congestion controlled, and must not be blocked either: `ack_eliciting` reflects
+                // pending frames that will never be sent once closing, and a closed connection no
+                // longer processes ACKs, so the window could never drain
+                // (see https://github.com/quinn-rs/quinn/issues/2785)
+                if ack_eliciting && self.spaces[space_id].loss_probes == 0 && !close {
                     // Assume the current packet will get padded to fill the segment
                     let untracked_bytes = if let Some(builder) = &builder_storage {
                         buf_capacity - builder.partial_encode.start
@@ -628,6 +644,7 @@ impl Connection {
                     if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
                         space_idx += 1;
                         congestion_blocked = true;
+                        cwnd_blocked = true;
                         // We continue instead of breaking here in order to avoid
                         // blocking loss probes queued for higher spaces.
                         trace!("blocked by congestion control");
@@ -636,13 +653,21 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        self.path.congestion.window(),
-                        now,
-                    ) {
+                    let mtu = self.path.current_mtu();
+                    let delay = match metrics.pacer_rate {
+                        Some(rate) => self
+                            .path
+                            .pacing
+                            .delay_at_rate(rate, bytes_to_send, mtu, now),
+                        None => self.path.pacing.delay(
+                            smoothed_rtt,
+                            bytes_to_send,
+                            mtu,
+                            self.path.congestion.window(),
+                            now,
+                        ),
+                    };
+                    if let Some(delay) = delay {
                         self.timers.set(Timer::Pacing, delay);
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
@@ -957,6 +982,9 @@ impl Connection {
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
+        if cwnd_blocked {
+            self.path.congestion.on_cwnd_limited();
+        }
 
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
@@ -1557,7 +1585,7 @@ impl Connection {
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
 
-                self.on_packet_acked(now, info);
+                self.on_packet_acked(now, packet, space, info);
             }
         }
         self.stats.path.acked_ack_eliciting_packets = self
@@ -1606,7 +1634,7 @@ impl Connection {
                 // reordering.
                 if new_largest {
                     let sent = self.spaces[space].largest_acked_packet_sent;
-                    self.process_ecn(now, space, newly_acked.len() as u64, ecn, sent);
+                    self.process_ecn(now, space, newly_acked.len() as u64, ecn, sent, ack.largest);
                 }
             } else {
                 // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
@@ -1633,6 +1661,7 @@ impl Connection {
         newly_acked: u64,
         ecn: frame::EcnCounts,
         largest_sent_time: Instant,
+        largest_sent_pn: u64,
     ) {
         match self.spaces[space].detect_ecn(newly_acked, ecn) {
             Err(e) => {
@@ -1648,13 +1677,19 @@ impl Connection {
                 self.path
                     .congestion
                     .on_congestion_event(now, largest_sent_time, false, 0);
+                self.path.congestion.on_ecn_congestion(
+                    now,
+                    largest_sent_time,
+                    largest_sent_pn,
+                    space,
+                );
             }
         }
     }
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+    fn on_packet_acked(&mut self, now: Instant, pn: u64, space: SpaceId, info: SentPacket) {
         self.remove_in_flight(&info);
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
@@ -1663,6 +1698,15 @@ impl Connection {
                 now,
                 info.time_sent,
                 info.size.into(),
+                self.app_limited,
+                &self.path.rtt,
+            );
+            self.path.congestion.on_packet_acked(
+                now,
+                info.time_sent,
+                info.size,
+                pn,
+                space,
                 self.app_limited,
                 &self.path.rtt,
             );
@@ -1747,8 +1791,9 @@ impl Connection {
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
         // include max ACK delay, i.e. operate as if in Data space (see RFC9001 §7.6.1).
-        let congestion_period =
-            self.pto(SpaceId::Data) * self.config.persistent_congestion_threshold;
+        let congestion_period = self
+            .pto(SpaceId::Data)
+            .saturating_mul(self.config.persistent_congestion_threshold);
         let mut persistent_congestion_start: Option<Instant> = None;
         let mut prev_packet = None;
         let mut in_persistent_congestion = false;
@@ -1833,6 +1878,9 @@ impl Connection {
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
+                self.path
+                    .congestion
+                    .on_packet_lost(now, info.size, packet, pn_space);
             }
 
             if self.path.mtud.black_hole_detected(now) {
@@ -2550,7 +2598,7 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, info);
+                    self.on_packet_acked(now, 0, SpaceId::Initial, info);
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
@@ -2761,7 +2809,10 @@ impl Connection {
                 Frame::Ack(ack) => {
                     self.on_ack_received(now, packet.header.space(), ack)?;
                 }
-                Frame::Close(reason) => {
+                // Per RFC 9000 §12.4 Table 3, only a CONNECTION_CLOSE frame of type 0x1c may
+                // appear in Initial or Handshake packets. An application close (0x1d) falls
+                // through to the catch-all arm below.
+                Frame::Close(reason @ Close::Connection(_)) => {
                     self.error = Some(reason.into());
                     self.state = State::Draining;
                     return Ok(());
@@ -2798,7 +2849,8 @@ impl Connection {
         let mut close = None;
         let payload_len = payload.len();
         let mut ack_eliciting = false;
-        for result in frame::Iter::new(payload)? {
+        let mut frames = frame::Iter::new(payload)?;
+        while let Some((result, frame_size)) = frames.next_with_size() {
             let frame = result?;
             let span = match frame {
                 Frame::Padding => continue,
@@ -2824,15 +2876,13 @@ impl Connection {
             }
 
             let _guard = span.as_ref().map(|x| x.enter());
-            if packet.header.is_0rtt() {
-                match frame {
-                    Frame::Crypto(_) | Frame::Close(Close::Application(_)) => {
-                        return Err(TransportError::PROTOCOL_VIOLATION(
-                            "illegal frame type in 0-RTT",
-                        ));
-                    }
-                    _ => {}
-                }
+            // RFC 9000 §12.5: CRYPTO frames cannot be sent in 0-RTT packets. Both
+            // CONNECTION_CLOSE types are permitted there, as 0-RTT belongs to the application
+            // data packet number space; see §12.4 Table 3.
+            if packet.header.is_0rtt() && matches!(frame, Frame::Crypto(_)) {
+                return Err(TransportError::PROTOCOL_VIOLATION(
+                    "illegal frame type in 0-RTT",
+                ));
             }
             ack_eliciting |= frame.is_ack_eliciting();
 
@@ -3022,6 +3072,14 @@ impl Connection {
                     token_store.insert(server_name, token);
                 }
                 Frame::Datagram(datagram) => {
+                    // The transport parameter limits the encoded frame size, not its heap usage.
+                    if self
+                        .config
+                        .datagram_receive_buffer_size
+                        .is_some_and(|window| frame_size > window.min(u16::MAX.into()))
+                    {
+                        return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
+                    }
                     if self
                         .datagrams
                         .received(datagram, &self.config.datagram_receive_buffer_size)?

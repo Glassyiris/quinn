@@ -1,15 +1,17 @@
 //! Logic for controlling the rate at which data is sent
 
-use crate::Instant;
 use crate::connection::RttEstimator;
+use crate::{Instant, SpaceId};
 use std::any::Any;
 use std::sync::Arc;
 
 mod bbr;
+mod bbr3;
 mod cubic;
 mod new_reno;
 
 pub use bbr::{Bbr, BbrConfig};
+pub use bbr3::{Bbr3, Bbr3Config};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
 
@@ -45,6 +47,44 @@ pub trait Controller: Send + Sync {
     ) {
     }
 
+    /// One ack-eliciting packet was just sent
+    ///
+    /// Unlike [`Controller::on_sent`], which summarizes a batch of datagrams, this is called once
+    /// per packet. Packet numbers are only unique within `space`.
+    #[allow(unused_variables)]
+    fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64, space: SpaceId) {}
+
+    /// One ack-eliciting packet was acknowledged
+    ///
+    /// Called alongside [`Controller::on_ack`] for the same packet.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u16,
+        pn: u64,
+        space: SpaceId,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+    }
+
+    /// One packet was declared lost
+    ///
+    /// Called for each lost packet before [`Controller::on_congestion_event`] summarizes the batch.
+    #[allow(unused_variables)]
+    fn on_packet_lost(&mut self, now: Instant, bytes: u16, pn: u64, space: SpaceId) {}
+
+    /// The peer reported ECN congestion marks on packets up to `largest_pn`
+    ///
+    /// Called alongside [`Controller::on_congestion_event`] with zero `lost_bytes`.
+    #[allow(unused_variables)]
+    fn on_ecn_congestion(&mut self, now: Instant, sent: Instant, largest_pn: u64, space: SpaceId) {}
+
+    /// Data was ready to send but the congestion window was full
+    fn on_cwnd_limited(&mut self) {}
+
     /// Packets were deemed lost or marked congested
     ///
     /// `in_persistent_congestion` indicates whether all packets sent within the persistent
@@ -65,12 +105,18 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
-    /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
+    /// Retrieve implementation-specific metrics
+    ///
+    /// Populates `qlog` traces, and is read on every `poll_transmit` for
+    /// [`ControllerMetrics::pacer_rate`] and [`ControllerMetrics::send_quantum`], so it must be
+    /// cheap.
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
             pacing_rate: None,
+            pacer_rate: None,
+            send_quantum: None,
         }
     }
 
@@ -92,8 +138,15 @@ pub struct ControllerMetrics {
     pub congestion_window: u64,
     /// Slow start threshold (bytes)
     pub ssthresh: Option<u64>,
-    /// Pacing rate (bits/s)
+    /// Pacing rate (bits/s), reported for diagnostics only
     pub pacing_rate: Option<u64>,
+    /// Rate at which the pacer releases packets (bytes/s)
+    ///
+    /// When set, this replaces the pacing rate the connection would otherwise derive from the
+    /// congestion window and RTT.
+    pub pacer_rate: Option<u64>,
+    /// Upper bound on the bytes sent in one batch of datagrams
+    pub send_quantum: Option<u64>,
 }
 
 /// Constructs controllers on demand

@@ -30,6 +30,7 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
+    packet::{Header, InitialHeader, PacketNumber},
     transport_parameters::TransportParameters,
 };
 mod util;
@@ -1767,6 +1768,57 @@ fn connection_close_sends_acks() {
         client_acks_2 > client_acks,
         "Connection close should send pending ACKs"
     );
+}
+
+/// A connection closed while its congestion window is saturated must still deliver
+/// CONNECTION_CLOSE to the peer promptly, rather than leaving the peer to discover the close via
+/// its idle timeout (see https://github.com/quinn-rs/quinn/issues/2785)
+#[test]
+fn connection_close_while_congestion_blocked() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+
+    // Saturate the congestion window with unacknowledged stream data by transmitting from the
+    // client without driving the server, so no ACKs come back and in-flight bytes stay pinned at
+    // the window
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s)
+        .write(&[42; 1024 * 1024])
+        .unwrap();
+    pair.drive_client();
+
+    // Close while the window is full and stream data is still pending
+    const REASON: &[u8] = b"whee";
+    let close_time = pair.time;
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt(42),
+        REASON.into(),
+    );
+
+    // Step the simulation by hand so we can catch the exact moment the server hears about the
+    // close: check for the event after each packet exchange, before the clock jumps ahead
+    let mut result = None;
+    loop {
+        pair.drive_client();
+        pair.drive_server();
+        while let Some(event) = pair.server_conn_mut(server_ch).poll() {
+            if let Event::ConnectionLost { reason } = event {
+                result = Some((reason, pair.time));
+            }
+        }
+        if result.is_some() || !pair.step() {
+            break;
+        }
+    }
+    let (reason, delivered_at) = result.expect("server never learned of the close");
+    assert_matches!(reason, ConnectionError::ApplicationClosed(
+        ApplicationClose { error_code: VarInt(42), ref reason }
+    ) if reason == REASON);
+    // Close packets aren't congestion controlled and the test link has no latency, so the close
+    // should arrive the moment it was issued — any delay means a timer had to rescue it
+    assert_eq!(delivered_at, close_time);
 }
 
 #[test]
@@ -4639,4 +4691,300 @@ fn receive_window_is_fixed_without_autotune() {
     for _ in 0..4 {
         assert_eq!(autotune_round(&mut pair, ch, Duration::ZERO), 2000);
     }
+}
+
+/// A CONNECTION_CLOSE frame of type 0x1d must be rejected in an Initial packet
+///
+/// RFC 9000 §12.4 Table 3 lists CONNECTION_CLOSE with the packet-type marker `ih01`, defined as
+/// "Only a CONNECTION_CLOSE frame of type 0x1c can appear in Initial or Handshake packets", and
+/// §12.4 requires that "An endpoint MUST treat receipt of a frame in a packet type that is not
+/// permitted as a connection error of type PROTOCOL_VIOLATION". §12.5 repeats the rule:
+/// "CONNECTION_CLOSE frames signaling application errors (type 0x1d) MUST only appear in the
+/// application data packet number space."
+#[test]
+fn application_close_in_initial_is_rejected() {
+    let _guard = subscribe();
+    let server_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 4433);
+    let mut client = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let now = Instant::now();
+    let (_, mut conn) = client
+        .connect(now, client_config(), server_addr, "localhost")
+        .unwrap();
+
+    // Grab the client's Initial packet so we can learn the connection IDs and version it chose.
+    let mut buf = Vec::new();
+    let transmit = conn
+        .poll_transmit(now, 1, &mut buf)
+        .expect("client should send an Initial packet");
+    let initial = &buf[..transmit.size];
+    // Long header: flags(1) version(4) dcid_len(1) dcid scid_len(1) scid ...
+    let version = u32::from_be_bytes(initial[1..5].try_into().unwrap());
+    let dcid_len = initial[5] as usize;
+    let orig_dst_cid = ConnectionId::new(&initial[6..6 + dcid_len]);
+    let scid_len = initial[6 + dcid_len] as usize;
+    let client_cid = ConnectionId::new(&initial[7 + dcid_len..7 + dcid_len + scid_len]);
+
+    // Forge a server Initial packet whose payload is a single APPLICATION_CLOSE (0x1d) frame.
+    // Initial packets are protected with keys derived from the client's original destination
+    // connection ID, which travels in the clear, so anyone who observes the handshake can do this.
+    let keys = server_config()
+        .crypto
+        .initial_keys(version, &orig_dst_cid)
+        .unwrap();
+    let number = PacketNumber::U8(0);
+    let header = Header::Initial(InitialHeader {
+        dst_cid: client_cid,
+        src_cid: ConnectionId::new(&[]),
+        token: Bytes::new(),
+        number,
+        version,
+    });
+    let mut packet = Vec::new();
+    let partial = header.encode(&mut packet);
+    let header_len = packet.len();
+    // APPLICATION_CLOSE: type 0x1d, Error Code (varint) = 42, Reason Phrase Length (varint) = 0
+    packet.extend_from_slice(&[0x1d, 0x2a, 0x00]);
+    // PADDING, so that the packet is long enough for header protection sampling
+    packet.resize(header_len + 16, 0);
+    // Room for the AEAD tag
+    packet.resize(packet.len() + keys.packet.local.tag_len(), 0);
+    partial.finish(
+        &mut packet,
+        keys.header.local.as_ref(),
+        Some((0, keys.packet.local.as_ref())),
+    );
+
+    let event = client.handle(
+        now,
+        server_addr,
+        None,
+        None,
+        BytesMut::from(&packet[..]),
+        &mut buf,
+    );
+    let Some(DatagramEvent::ConnectionEvent(_, event)) = event else {
+        panic!("forged Initial packet was not routed to the connection");
+    };
+    conn.handle_event(event);
+
+    assert_matches!(
+        conn.poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::TransportError(TransportError {
+                code: TransportErrorCode::PROTOCOL_VIOLATION,
+                ..
+            })
+        })
+    );
+}
+
+#[test]
+fn congestion_controller_sees_each_packet_once() {
+    use crate::congestion::{Controller, ControllerFactory};
+    use std::{any::Any, collections::BTreeSet, sync::Mutex};
+
+    #[derive(Default)]
+    struct Log {
+        sent: Vec<(SpaceId, u64)>,
+        acked: Vec<(SpaceId, u64)>,
+        lost: Vec<(SpaceId, u64)>,
+        cwnd_limited: u64,
+    }
+
+    struct Recording(Arc<Mutex<Log>>);
+
+    impl Controller for Recording {
+        fn on_packet_sent(&mut self, _: Instant, _: u16, pn: u64, space: SpaceId) {
+            self.0.lock().unwrap().sent.push((space, pn));
+        }
+
+        fn on_packet_acked(
+            &mut self,
+            _: Instant,
+            _: Instant,
+            _: u16,
+            pn: u64,
+            space: SpaceId,
+            _: bool,
+            _: &crate::RttEstimator,
+        ) {
+            self.0.lock().unwrap().acked.push((space, pn));
+        }
+
+        fn on_packet_lost(&mut self, _: Instant, _: u16, pn: u64, space: SpaceId) {
+            self.0.lock().unwrap().lost.push((space, pn));
+        }
+
+        fn on_cwnd_limited(&mut self) {
+            self.0.lock().unwrap().cwnd_limited += 1;
+        }
+
+        fn on_congestion_event(&mut self, _: Instant, _: Instant, _: bool, _: u64) {}
+
+        fn on_mtu_update(&mut self, _: u16) {}
+
+        fn window(&self) -> u64 {
+            16 * 1200
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self(self.0.clone()))
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    struct Factory(Arc<Mutex<Log>>);
+
+    impl ControllerFactory for Factory {
+        fn build(self: Arc<Self>, _: Instant, _: u16) -> Box<dyn Controller> {
+            Box::new(Recording(self.0.clone()))
+        }
+    }
+
+    let _guard = subscribe();
+    let log = Arc::new(Mutex::new(Log::default()));
+    let mut transport = TransportConfig::default();
+    transport
+        .congestion_controller_factory(Arc::new(Factory(log.clone())))
+        .mtu_discovery_config(None);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let data = vec![0; 256 * 1024];
+    let mut written = 0;
+    while written < data.len() {
+        written += pair
+            .client_send(client_ch, s)
+            .write(&data[written..])
+            .unwrap();
+    }
+    pair.drive_client();
+    // Lose two datagrams from the middle of the first window so later ACKs declare them lost
+    let delivered = pair.server.inbound.len();
+    assert!(delivered > 6);
+    pair.server.inbound.remove(3);
+    pair.server.inbound.remove(3);
+    pair.drive();
+
+    let log = log.lock().unwrap();
+    let sent = log.sent.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        sent.len(),
+        log.sent.len(),
+        "a packet was reported sent twice"
+    );
+    for space in [SpaceId::Initial, SpaceId::Data] {
+        assert!(log.sent.iter().any(|&(s, _)| s == space), "{space:?}");
+    }
+    let acked = log.acked.iter().copied().collect::<BTreeSet<_>>();
+    let lost = log.lost.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        acked.len(),
+        log.acked.len(),
+        "a packet was reported acked twice"
+    );
+    assert_eq!(
+        lost.len(),
+        log.lost.len(),
+        "a packet was reported lost twice"
+    );
+    assert!(acked.is_disjoint(&lost));
+    assert!(acked.is_subset(&sent));
+    assert!(lost.iter().all(|&(space, _)| space == SpaceId::Data));
+    assert!(!lost.is_empty());
+    for packet in sent.iter().filter(|&&(space, _)| space == SpaceId::Data) {
+        assert!(
+            acked.contains(packet) || lost.contains(packet),
+            "{packet:?} unresolved"
+        );
+    }
+    assert!(log.cwnd_limited > 0);
+}
+
+#[test]
+fn pacer_follows_controller_rate() {
+    use crate::congestion::{Controller, ControllerFactory, ControllerMetrics};
+    use std::any::Any;
+
+    const RATE: u64 = 1_250_000;
+
+    struct Fixed;
+
+    impl Controller for Fixed {
+        fn on_congestion_event(&mut self, _: Instant, _: Instant, _: bool, _: u64) {}
+
+        fn on_mtu_update(&mut self, _: u16) {}
+
+        fn window(&self) -> u64 {
+            64 * 1024 * 1024
+        }
+
+        fn metrics(&self) -> ControllerMetrics {
+            ControllerMetrics {
+                congestion_window: self.window(),
+                pacer_rate: Some(RATE),
+                ..Default::default()
+            }
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self)
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    struct Factory;
+
+    impl ControllerFactory for Factory {
+        fn build(self: Arc<Self>, _: Instant, _: u16) -> Box<dyn Controller> {
+            Box::new(Fixed)
+        }
+    }
+
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport
+        .congestion_controller_factory(Arc::new(Factory))
+        .mtu_discovery_config(None);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(config);
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let data = vec![0; 500 * 1024];
+    let mut written = 0;
+    while written < data.len() {
+        written += pair
+            .client_send(client_ch, s)
+            .write(&data[written..])
+            .unwrap();
+    }
+    pair.client_send(client_ch, s).finish().unwrap();
+    let start = pair.time;
+    pair.drive();
+    let elapsed = (pair.time - start).as_secs_f64();
+    let expected = data.len() as f64 / RATE as f64;
+    assert!(
+        elapsed > expected * 0.9 && elapsed < expected * 1.25,
+        "sent {} bytes in {elapsed:.3}s, expected about {expected:.3}s",
+        data.len()
+    );
 }

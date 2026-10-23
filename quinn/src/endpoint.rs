@@ -370,8 +370,9 @@ impl Future for EndpointDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut endpoint = self.0.state.lock().unwrap();
-        if endpoint.driver.is_none() {
-            endpoint.driver = Some(cx.waker().clone());
+        match endpoint.driver.as_mut() {
+            Some(old_waker) => old_waker.clone_from(cx.waker()),
+            None => endpoint.driver = Some(cx.waker().clone()),
         }
 
         let now = endpoint.runtime.now();
@@ -792,6 +793,8 @@ struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    /// Reused buffer that received datagrams are copied into and split into owned slices.
+    datagrams: BytesMut,
     recv_limiter: WorkLimiter,
 }
 
@@ -801,12 +804,10 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
+            as usize
+            * max_receive_segments;
+        let recv_buf = vec![0; datagram_capacity * BATCH_SIZE];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -815,6 +816,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            datagrams: BytesMut::with_capacity(datagram_capacity),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -844,8 +846,13 @@ impl RecvState {
             match socket.poll_recv(cx, &mut iovs, &mut metas) {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
+                    let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
+                    self.datagrams.reserve(batch_len);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
+                        self.datagrams.extend_from_slice(&buf[..meta.len]);
+                    }
+                    for meta in metas.iter().take(msgs) {
+                        let mut data = self.datagrams.split_to(meta.len);
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
                             let mut response_buffer = Vec::new();
@@ -893,7 +900,7 @@ impl RecvState {
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
                 // attacker
                 Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
-                    continue;
+                    self.recv_limiter.record_work(1);
                 }
                 Poll::Ready(Err(e)) => {
                     return Err(e);
@@ -926,4 +933,76 @@ struct PollProgress {
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(all(
+    test,
+    feature = "runtime-tokio",
+    any(feature = "ring", feature = "aws-lc-rs")
+))]
+mod tests {
+    use super::*;
+    use crate::{UdpPoller, runtime::TokioRuntime};
+
+    #[test]
+    fn ignored_receive_errors_respect_work_budget() {
+        let mut endpoint =
+            proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = RecvState::new(tx, 1, &endpoint);
+        let now = Instant::now();
+
+        // Calibrate the next receive cycles to allow two work items each.
+        state.recv_limiter.start_cycle(|| now);
+        state.recv_limiter.record_work(2);
+        state.recv_limiter.finish_cycle(|| now + RECV_TIME_BOUND);
+
+        let socket = ErrorSocket {
+            remaining: Mutex::new(5),
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        for (remaining, keep_going) in [(3, true), (1, true), (0, false)] {
+            state.recv_limiter.start_cycle(|| now);
+            let progress = state
+                .poll_socket(&mut cx, &mut endpoint, &socket, &TokioRuntime, now)
+                .unwrap();
+            state.recv_limiter.finish_cycle(|| now);
+            assert_eq!(*socket.remaining.lock().unwrap(), remaining);
+            assert_eq!(progress.keep_going, keep_going);
+            assert!(!progress.received_connection_packet);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ErrorSocket {
+        remaining: Mutex<usize>,
+    }
+
+    impl AsyncUdpSocket for ErrorSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            unreachable!("ignored receive errors must not produce responses")
+        }
+
+        fn try_send(&self, _transmit: &udp::Transmit) -> io::Result<()> {
+            unreachable!("ignored receive errors must not produce responses")
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            let mut remaining = self.remaining.lock().unwrap();
+            if *remaining == 0 {
+                return Poll::Pending;
+            }
+            *remaining -= 1;
+            Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+    }
 }

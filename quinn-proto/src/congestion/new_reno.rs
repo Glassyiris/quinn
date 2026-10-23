@@ -117,6 +117,8 @@ impl Controller for NewReno {
             congestion_window: self.window(),
             ssthresh: Some(self.ssthresh),
             pacing_rate: None,
+            pacer_rate: None,
+            send_quantum: None,
         }
     }
 
