@@ -1613,35 +1613,6 @@ impl Bbr3 {
 }
 
 impl Bbr3 {
-    fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64, space: SpaceId) {
-        self.handle_restart_from_idle(now);
-        if self.inflight == 0 {
-            self.first_send_time = Some(now);
-            self.delivered_time = Some(now);
-        }
-        let added_bytes = bytes as u64;
-        self.inflight += added_bytes;
-        self.packets[space as usize].push_back(BbrPacket {
-            delivered: self.delivered,
-            delivered_time: self.delivered_time.unwrap_or(now),
-            first_send_time: self.first_send_time.unwrap_or(now),
-            send_time: now,
-            is_app_limited: self.app_limited != 0,
-            tx_in_flight: self.inflight,
-            packet_number: pn,
-            space,
-            size: bytes,
-            lost: self.lost,
-            acknowledged: false,
-            stale: false,
-            round_count: self.round_count,
-        });
-    }
-
-    fn on_cwnd_limited(&mut self) {
-        self.cwnd_limited_this_round = true;
-    }
-
     /// UpdateRateSample accumulates `C.delivered` and `C.delivered_time` for every ACKed packet,
     /// independently of the newest-packet branch that folds the rate sample into the model, so
     /// neither may be conditional on a rate sample already existing.
@@ -1842,16 +1813,6 @@ impl Bbr3 {
         }
     }
 
-    fn on_mtu_update(&mut self, new_mtu: u16) {
-        self.smss = Ord::min(
-            Ord::max(MIN_MAX_DATAGRAM_SIZE, new_mtu) as u64,
-            MAX_DATAGRAM_SIZE,
-        );
-        self.min_pipe_cwnd = 4 * self.smss;
-        self.set_send_quantum();
-        self.set_cwnd();
-    }
-
     // quinn 0.11 does not report ACK frequency changes to congestion controllers
     #[cfg_attr(not(test), allow(dead_code))]
     fn on_ack_frequency_update(
@@ -1862,38 +1823,32 @@ impl Bbr3 {
         self.ack_eliciting_threshold = ack_eliciting_threshold;
         self.max_ack_delay = requested_max_ack_delay;
     }
-
-    fn window(&self) -> u64 {
-        self.cwnd
-    }
-
-    fn metrics(&self) -> ControllerMetrics {
-        let pacing_rate = self.pacing_rate.round() as u64;
-        ControllerMetrics {
-            congestion_window: self.window(),
-            ssthresh: None,
-            pacing_rate: Some(pacing_rate.saturating_mul(8)),
-            pacer_rate: Some(pacing_rate),
-            send_quantum: Some(self.send_quantum),
-        }
-    }
-
-    fn clone_box(&self) -> Box<dyn Controller> {
-        Box::new(self.clone())
-    }
-
-    fn initial_window(&self) -> u64 {
-        self.initial_cwnd
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
 }
 
 impl Controller for Bbr3 {
     fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64, space: SpaceId) {
-        Self::on_packet_sent(self, now, bytes, pn, space);
+        self.handle_restart_from_idle(now);
+        if self.inflight == 0 {
+            self.first_send_time = Some(now);
+            self.delivered_time = Some(now);
+        }
+        let added_bytes = bytes as u64;
+        self.inflight += added_bytes;
+        self.packets[space as usize].push_back(BbrPacket {
+            delivered: self.delivered,
+            delivered_time: self.delivered_time.unwrap_or(now),
+            first_send_time: self.first_send_time.unwrap_or(now),
+            send_time: now,
+            is_app_limited: self.app_limited != 0,
+            tx_in_flight: self.inflight,
+            packet_number: pn,
+            space,
+            size: bytes,
+            lost: self.lost,
+            acknowledged: false,
+            stale: false,
+            round_count: self.round_count,
+        });
     }
 
     fn on_packet_acked(
@@ -1965,31 +1920,44 @@ impl Controller for Bbr3 {
     }
 
     fn on_cwnd_limited(&mut self) {
-        Self::on_cwnd_limited(self);
+        self.cwnd_limited_this_round = true;
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
-        Self::on_mtu_update(self, new_mtu);
+        self.smss = Ord::min(
+            Ord::max(MIN_MAX_DATAGRAM_SIZE, new_mtu) as u64,
+            MAX_DATAGRAM_SIZE,
+        );
+        self.min_pipe_cwnd = 4 * self.smss;
+        self.set_send_quantum();
+        self.set_cwnd();
     }
 
     fn window(&self) -> u64 {
-        Self::window(self)
+        self.cwnd
     }
 
     fn metrics(&self) -> ControllerMetrics {
-        Self::metrics(self)
+        let pacing_rate = self.pacing_rate.round() as u64;
+        ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: None,
+            pacing_rate: Some(pacing_rate.saturating_mul(8)),
+            pacer_rate: Some(pacing_rate),
+            send_quantum: Some(self.send_quantum),
+        }
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
-        Self::clone_box(self)
+        Box::new(self.clone())
     }
 
     fn initial_window(&self) -> u64 {
-        Self::initial_window(self)
+        self.initial_cwnd
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        Self::into_any(self)
+        self
     }
 }
 
