@@ -105,7 +105,11 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
-    /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
+    /// Retrieve implementation-specific metrics
+    ///
+    /// Populates `qlog` traces, and is read on every `poll_transmit` for
+    /// [`ControllerMetrics::pacer_rate`] and [`ControllerMetrics::send_quantum`], so it must be
+    /// cheap.
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
