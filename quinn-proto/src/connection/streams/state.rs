@@ -310,7 +310,10 @@ impl StreamsState {
             }
         };
         if self.stream_receive_window > self.initial_stream_receive_window
-            && rs.max_stream_data_increases(self.stream_receive_window)
+            && rs
+                .max_stream_data(self.stream_receive_window)
+                .1
+                .should_transmit()
         {
             if let Some(pending) = pending {
                 pending.max_stream_data.insert(id);
@@ -2401,6 +2404,68 @@ mod tests {
             .unwrap();
         future_client.queue_stream_receive_window(id, &mut future_pending);
         assert!(future_pending.max_stream_data.is_empty());
+    }
+
+    #[test]
+    fn runtime_stream_receive_window_batches_receive_path_credit() {
+        let mut client = make(Side::Client);
+        let window = client.stream_receive_window * 2;
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let frame = |offset: u64, len: usize| frame::Stream {
+            id,
+            offset,
+            fin: false,
+            data: Bytes::from(vec![0; len]),
+        };
+        let mut pending = Retransmits::default();
+        let _ = client
+            .received_and_queue(frame(0, 100), 100, &mut pending)
+            .unwrap();
+        client.set_stream_receive_window(VarInt::try_from(window).unwrap(), &mut pending);
+        assert!(pending.max_stream_data.contains(&id));
+        {
+            let recv = client
+                .recv
+                .get_mut(&id)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .as_open_recv_mut()
+                .unwrap();
+            let (advertised, _) = recv.max_stream_data(window);
+            recv.record_sent_max_stream_data(advertised);
+        }
+        pending.max_stream_data.clear();
+
+        let read = |client: &mut StreamsState| {
+            let mut read_pending = Retransmits::default();
+            let mut recv = RecvStream {
+                id,
+                state: client,
+                pending: &mut read_pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            while let Ok(Some(_)) = chunks.next(usize::MAX) {}
+            let _ = chunks.finalize();
+        };
+
+        // Credit gained by a small read is below the batching threshold.
+        read(&mut client);
+        let _ = client
+            .received_and_queue(frame(100, 100), 100, &mut pending)
+            .unwrap();
+        assert!(pending.max_stream_data.is_empty());
+
+        // Once reads free a significant share of the window, a received frame queues credit.
+        let large = (window / 8) as usize;
+        let _ = client
+            .received_and_queue(frame(200, large), large, &mut pending)
+            .unwrap();
+        read(&mut client);
+        let _ = client
+            .received_and_queue(frame(200 + large as u64, 1), 1, &mut pending)
+            .unwrap();
+        assert!(pending.max_stream_data.contains(&id));
     }
 
     #[test]
