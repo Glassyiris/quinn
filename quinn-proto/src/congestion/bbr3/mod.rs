@@ -215,8 +215,8 @@ struct BbrPacket {
     /// been flagged acknowledged hence the necessity of this flag being set before we remove
     /// it from packets.
     acknowledged: bool,
-    /// once a packet has been acknowledged on a given round it is marked for removal on the next
-    /// round.
+    /// once a packet has been acknowledged, or has aged past [`ROUND_COUNT_WINDOW`], and every
+    /// packet ahead of it in its queue has too, it is marked for removal on the next ACK frame.
     stale: bool,
     /// used to mark packets stale if they're far from the current round <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1>
     round_count: u64,
@@ -1738,13 +1738,23 @@ impl Bbr3 {
             } else if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
+            // Each queue is ordered by packet number and `round_count`, and nearly every packet
+            // resolves near its front, so prune only the resolved prefix: the work per ACK frame
+            // stays proportional to the packets resolved, not to everything in flight. An
+            // acknowledged packet behind an unresolved one waits until that one is acknowledged,
+            // declared lost, or ages out. Lookups only target unacknowledged packets or the
+            // largest packet of the ACK frame being processed, so this changes no decision; it
+            // only keeps up to `ROUND_COUNT_WINDOW` rounds of packets queued behind a stuck one.
             let round_count = self.round_count;
             for packets in self.packets.iter_mut() {
-                packets.retain(|&p| !p.stale);
+                while packets.front().is_some_and(|p| p.stale) {
+                    packets.pop_front();
+                }
                 for p in packets.iter_mut() {
-                    if p.acknowledged || round_count - p.round_count > ROUND_COUNT_WINDOW {
-                        p.stale = true;
+                    if !(p.acknowledged || round_count - p.round_count > ROUND_COUNT_WINDOW) {
+                        break;
                     }
+                    p.stale = true;
                 }
             }
             if let Some(mut rate_sample) = self.rs {
@@ -6991,5 +7001,41 @@ mod test {
             numbers(SpaceId::Data),
             [(0, false), (1, true), (2, false), (3, false)]
         );
+    }
+
+    #[test]
+    fn unresolved_head_packet_does_not_pin_the_queue() {
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), 1200);
+        let rtt = RttEstimator::new(Duration::from_millis(10));
+        let mut now = Instant::now();
+        // Packet 0 is never acknowledged nor declared lost, so it heads the queue throughout
+        Controller::on_packet_sent(&mut bbr, now, 1200, 0, SpaceId::Data);
+        let mut pn = 1;
+        for _ in 0..30 {
+            let sent = now;
+            let batch = pn..pn + 8;
+            for p in batch.clone() {
+                Controller::on_packet_sent(&mut bbr, sent, 1200, p, SpaceId::Data);
+            }
+            pn = batch.end;
+            now += Duration::from_millis(10);
+            for p in batch.clone() {
+                Controller::on_packet_acked(
+                    &mut bbr,
+                    now,
+                    sent,
+                    1200,
+                    p,
+                    SpaceId::Data,
+                    false,
+                    &rtt,
+                );
+            }
+            Controller::on_end_acks(&mut bbr, now, 1200, false, Some(batch.end - 1));
+        }
+        // Once the head ages past ROUND_COUNT_WINDOW the acknowledged packets behind it drain
+        // too, leaving only the latest frame's packets awaiting removal
+        let tracked = bbr.packets[SpaceId::Data as usize].len();
+        assert!(tracked <= 16, "{tracked} packets still tracked");
     }
 }
