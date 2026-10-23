@@ -79,8 +79,9 @@ const PROBE_RTT_DURATION_MS: u64 = 200;
 const PROBE_RTT_INTERVAL_SEC: u64 = 5;
 
 /// equivalent to BBR.LossThresh: A constant specifying the maximum tolerated per-round-trip packet
-/// loss rate when probing for bandwidth (the default is 2%).
-const LOSS_THRESH: f64 = 0.02;
+/// loss rate when probing for bandwidth. The draft uses 2%; 5% keeps random loss on long lossy
+/// paths from being read as congestion, which at 3% random loss cost about 14% of throughput.
+const LOSS_THRESH: f64 = 0.05;
 
 /// equivalent to BBR.Beta: A constant specifying the default multiplicative decrease to make upon
 /// each round trip during which the connection detects packet loss (the value is 0.7).
@@ -2279,7 +2280,7 @@ mod test {
     /// app keeps only `APP_WINDOW` bytes outstanding, well below cwnd), so
     /// `check_full_bw_reached` bails every round (`rate_sample.is_app_limited`
     /// short-circuit) and the bandwidth-plateau path can never end STARTUP. Loss
-    /// is then injected above `LOSS_THRESH` (2%), with at least
+    /// is then injected above `LOSS_THRESH` (5%), with at least
     /// `STARTUP_FULL_LOSS_CNT` discontiguous losses per round trip, so
     /// `check_startup_high_loss` observes the high loss rate and ends STARTUP:
     /// `full_bw_now`/`full_bw_reached` become true and the flow transitions
@@ -2300,10 +2301,10 @@ mod test {
         /// the loss path. Sized so a single round trip carries at least
         /// `STARTUP_FULL_LOSS_CNT` losses at the `LOSS_PERIOD` rate below.
         const APP_WINDOW: u64 = 200 * MSS;
-        /// drop 1 in every `LOSS_PERIOD` packets -> 4% loss, above `LOSS_THRESH`
-        /// (2%), spread evenly so each round trip carries loss over its full
+        /// drop 1 in every `LOSS_PERIOD` packets -> 10% loss, above `LOSS_THRESH`
+        /// (5%), spread evenly so each round trip carries loss over its full
         /// sequence range.
-        const LOSS_PERIOD: u64 = 25;
+        const LOSS_PERIOD: u64 = 10;
 
         // bottleneck serialization time for one MSS-sized packet
         let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
@@ -2825,7 +2826,7 @@ mod test {
     ///     DRAIN -> PROBE_BW -> PROBE_UP.
     ///  2. Once PROBE_UP is entered, the app is throttled to a small fixed window (`APP_WINDOW`,
     ///     well below cwnd) so every fresh sample is app-limited, and 1-in-`LOSS_PERIOD` packets
-    ///     are dropped -> a per-round loss rate (4%) above `BBR.LossThresh` (2%).
+    ///     are dropped -> a per-round loss rate (10%) above `BBR.LossThresh` (5%).
     ///
     /// In PROBE_UP `bw_probe_samples` is true, so each lost packet is fed through
     /// `process_lost_packet`; `is_inflight_too_high()` sees the loss exceed
@@ -2857,10 +2858,10 @@ mod test {
         /// so the sender is app-limited (never cwnd-limited), keeping every sample
         /// app-limited and isolating the loss path. Matches A.2's window.
         const APP_WINDOW: u64 = 200 * MSS;
-        /// drop 1 in every `LOSS_PERIOD` packets -> 4% loss, above `LOSS_THRESH`
-        /// (2%), spread evenly so each round trip carries loss over its full
+        /// drop 1 in every `LOSS_PERIOD` packets -> 10% loss, above `LOSS_THRESH`
+        /// (5%), spread evenly so each round trip carries loss over its full
         /// sequence range.
-        const LOSS_PERIOD: u64 = 25;
+        const LOSS_PERIOD: u64 = 10;
 
         // bottleneck serialization time for one MSS-sized packet
         let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
@@ -5602,7 +5603,7 @@ mod test {
         const MSS: u64 = 1200;
         /// simulated propagation round-trip time (100ms), matching A.1
         const RTT_NS: u64 = 100_000_000;
-        /// bottleneck bandwidth: 10 Mbit/s in bytes/sec. Modest BDP keeps `LOSS_THRESH` (2% of
+        /// bottleneck bandwidth: 10 Mbit/s in bytes/sec. Modest BDP keeps `LOSS_THRESH` (5% of
         /// tx_in_flight) small, so a short reordering burst trips `is_inflight_too_high`.
         const BW: f64 = 1_250_000.0;
         const FWD_NS: u64 = RTT_NS / 2;
@@ -5882,7 +5883,7 @@ mod test {
         const MSS: u64 = 1200;
         /// simulated propagation round-trip time (100ms), matching A.1
         const RTT_NS: u64 = 100_000_000;
-        /// bottleneck bandwidth: 10 Mbit/s in bytes/sec. Modest BDP keeps `LOSS_THRESH` (2% of
+        /// bottleneck bandwidth: 10 Mbit/s in bytes/sec. Modest BDP keeps `LOSS_THRESH` (5% of
         /// tx_in_flight) small, so a short tail burst trips `is_inflight_too_high`.
         const BW: f64 = 1_250_000.0;
         const FWD_NS: u64 = RTT_NS / 2;
@@ -6439,7 +6440,7 @@ mod test {
         /// simulated propagation round-trip time (100ms), matching A.18/A.19
         const RTT_NS: u64 = 100_000_000;
         /// bottleneck bandwidth: 10 Mbit/s in bytes/sec. Modest BDP keeps `LOSS_THRESH`
-        /// (2% of tx_in_flight) small, so a short oldest-first loss burst trips
+        /// (5% of tx_in_flight) small, so a short oldest-first loss burst trips
         /// `is_inflight_too_high`.
         const BW: f64 = 1_250_000.0;
         const FWD_NS: u64 = RTT_NS / 2;
