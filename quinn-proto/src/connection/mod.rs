@@ -720,6 +720,13 @@ impl Connection {
                         // overrun
                         buf_capacity = buf.len();
 
+                        // Every later segment is capped at the first one's size. If that is
+                        // too small to be worth sending, end the batch so the rest goes out
+                        // at full size.
+                        if segment_size < MIN_PACKET_SPACE {
+                            break;
+                        }
+
                         // Check whether the data we planned to send will fit in the reduced segment
                         // size. If not, bail out and leave it for the next GSO batch so we don't
                         // end up trying to send an empty packet. We can't easily compute the right
@@ -973,8 +980,10 @@ impl Connection {
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
 
-        // Send MTU probe if necessary
-        if buf.is_empty() && self.state.is_established() {
+        // Send MTU probe if necessary. Only probe validated paths: probes bypass the
+        // anti-amplification check above, and until a migrated path is validated, its budget is
+        // needed for PATH_CHALLENGE.
+        if buf.is_empty() && self.state.is_established() && self.path.validated {
             let space_id = SpaceId::Data;
             let probe_size = self
                 .path
@@ -1834,7 +1843,7 @@ impl Connection {
 
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
-            let old_bytes_in_flight = self.path.in_flight.bytes;
+            let mut lost_ack_eliciting = false;
             // safe: lost_packets is populated just above
             let largest_lost_sent = self.spaces[pn_space]
                 .sent_packets
@@ -1859,6 +1868,8 @@ impl Connection {
                     self.orig_rem_cid,
                 );
 
+                let in_flight = self.path.is_in_flight(&info);
+                lost_ack_eliciting |= in_flight;
                 self.remove_in_flight(&info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
@@ -1866,12 +1877,14 @@ impl Connection {
                 self.spaces[pn_space].pending |= info.retransmits;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
 
-                self.spaces[pn_space].lost_packets.insert(
-                    packet,
-                    LostPacket {
-                        time_sent: info.time_sent,
-                    },
-                );
+                if in_flight {
+                    self.spaces[pn_space].lost_packets.insert(
+                        packet,
+                        LostPacket {
+                            time_sent: info.time_sent,
+                        },
+                    );
+                }
             }
 
             if self.path.mtud.black_hole_detected(now) {
@@ -1883,8 +1896,6 @@ impl Connection {
             }
 
             // Don't apply congestion penalty for lost ack-only packets
-            let lost_ack_eliciting = old_bytes_in_flight != self.path.in_flight.bytes;
-
             if lost_ack_eliciting {
                 self.stats.path.congestion_events += 1;
                 self.path.congestion.on_congestion_event(
@@ -2349,6 +2360,7 @@ impl Connection {
             partial_decode,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.side.side(),
             self.peer_params.stateless_reset_token,
         ) {
             self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
@@ -3793,6 +3805,7 @@ impl Connection {
             first_decode.clone(),
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.side.side(),
             self.peer_params.stateless_reset_token,
         )?;
 
