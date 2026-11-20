@@ -1199,6 +1199,7 @@ impl State {
             match sent {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Retry the same bytes only after the socket poller reports writability again.
                     self.buffered_transmit = Some(t);
                     continue;
                 }
@@ -1279,8 +1280,7 @@ impl State {
                         wake_all(&mut self.blocked_writers);
                         wake_all(&mut self.blocked_readers);
                         wake_all_notify(&mut self.stopped);
-                        // The driver holds the lock from processing rejection to publishing
-                        // Connected; no replacement stream can have registered a write yet.
+                        // The lock excludes replacement stream IDs until the rejected book is detached.
                         if let Some(receipts) = self.receipts.take() {
                             notifications.fail_all(receipts, crate::WriteError::ZeroRttRejected);
                         }

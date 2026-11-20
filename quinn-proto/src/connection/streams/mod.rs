@@ -306,7 +306,7 @@ impl<'a> SendStream<'a> {
         Ok(written)
     }
 
-    /// The offset of the next byte to be written by the application.
+    /// The next application write offset (zero before the first write), or `ClosedStream` if gone.
     pub fn write_offset(&self) -> Result<u64, ClosedStream> {
         let stream = self
             .state

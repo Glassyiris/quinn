@@ -61,11 +61,8 @@ impl SendStream {
             .await
     }
 
-    /// Like [`write`](Self::write), with a local submission receipt for exactly the accepted prefix.
-    ///
-    /// Canceling this write before it returns accepts no bytes. Once it returns, dropping the
-    /// [`SendReceipt`] cancels only observation. An accepted empty prefix has an immediately
-    /// successful receipt.
+    /// Like [`write`](Self::write), but also returns a [`SendReceipt`] for the accepted prefix.
+    /// Canceling the write before it returns accepts no bytes.
     pub async fn write_with_receipt(
         &mut self,
         buf: &[u8],
@@ -119,11 +116,9 @@ impl SendStream {
         .await
     }
 
-    /// Like [`write_chunks`](Self::write_chunks), with one receipt for the accepted bytes across chunks.
-    ///
-    /// Canceling this write before it returns leaves the chunks untouched. After success the
-    /// accepted bytes have been consumed from `bufs`, even if the [`SendReceipt`] is dropped or
-    /// later fails. A successful zero-byte write has an immediately successful receipt.
+    /// Like [`write_chunks`](Self::write_chunks), but returns one [`SendReceipt`] for the accepted
+    /// bytes across chunks. Canceling the write leaves `bufs` untouched; after success, a receipt
+    /// error does not put the consumed bytes back.
     pub async fn write_chunks_with_receipt(
         &mut self,
         bufs: &mut [Bytes],
