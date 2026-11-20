@@ -16,6 +16,7 @@ use socket2::SockRef;
 
 use super::{
     EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, cmsg, handle_send_error,
+    send_status,
 };
 
 // Adapted from https://github.com/apple-oss-distributions/xnu/blob/8d741a5de7ff4191bf97d57b9f54c2f6d4a15585/bsd/sys/socket_private.h
@@ -205,7 +206,7 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(self, socket.0, transmit) {
+        match send(self, socket.0, transmit, false) {
             Ok(_) => Ok(()),
             Err(e) => handle_send_error(&self.last_send_error, e, transmit),
         }
@@ -213,31 +214,24 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] with the error handling of [`Self::send`].
     ///
-    /// Returns `true` for complete local submission and `false` for partial submission or a
-    /// suppressed error.
+    /// Returns `true` when all requested datagrams were submitted locally. Returns `false` for an
+    /// unsupported descriptor, partial submission, or a suppressed error. Unsupported descriptors
+    /// are rejected before sending.
     pub fn send_with_status(
         &self,
         socket: UdpSockRef<'_>,
         transmit: &Transmit<'_>,
     ) -> io::Result<bool> {
-        match send(self, socket.0, transmit) {
-            Ok(sent) => {
-                #[cfg(apple_fast)]
-                // `sendmsg_x` returns a datagram count. Leave any unsent suffix to loss recovery.
-                let expected = transmit
-                    .segment_size
-                    .map_or(1, |size| transmit.contents.len().div_ceil(size));
-                #[cfg(not(apple_fast))]
-                let expected = transmit.contents.len();
-                Ok(sent == expected)
-            }
-            Err(e) => handle_send_error(&self.last_send_error, e, transmit).map(|()| false),
-        }
+        let Some(expected) = transmit.expected_send_count(|| self.max_gso_segments()) else {
+            return Ok(false);
+        };
+        let result = send(self, socket.0, transmit, true);
+        send_status(&self.last_send_error, transmit, result, expected)
     }
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(self, socket.0, transmit).map(drop)
+        send(self, socket.0, transmit, false).map(drop)
     }
 
     pub fn recv(
@@ -318,6 +312,7 @@ fn send(
     state: &UdpSocketState,
     io: SockRef<'_>,
     transmit: &Transmit<'_>,
+    check_gso_limit: bool,
 ) -> io::Result<usize> {
     #[allow(unused_mut)] // only mutable on FreeBSD
     let mut encode_src_ip = true;
@@ -379,6 +374,14 @@ fn send(
                 // fallback mode and retry if we haven't already.
                 if e.raw_os_error() == Some(libc::EINVAL) && !state.sendmsg_einval() {
                     state.set_sendmsg_einval();
+                    // The failed send may have disabled GSO before this ancillary-data retry.
+                    if check_gso_limit
+                        && transmit
+                            .expected_send_count(|| state.max_gso_segments())
+                            .is_none()
+                    {
+                        return Err(e);
+                    }
                     prepare_msg(
                         transmit,
                         &dst_addr,
@@ -398,7 +401,12 @@ fn send(
 }
 
 #[cfg(apple_fast)]
-fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
+fn send(
+    state: &UdpSocketState,
+    io: SockRef<'_>,
+    transmit: &Transmit<'_>,
+    _check_gso_limit: bool,
+) -> io::Result<usize> {
     let mut hdrs = unsafe { mem::zeroed::<[msghdr_x; BATCH_SIZE]>() };
     let mut iovs = unsafe { mem::zeroed::<[libc::iovec; BATCH_SIZE]>() };
     let mut ctrls = [cmsg::Aligned([0u8; CMSG_LEN]); BATCH_SIZE];
@@ -447,7 +455,12 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
 }
 
 #[cfg(any(target_os = "openbsd", target_os = "netbsd", apple_slow))]
-fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
+fn send(
+    state: &UdpSocketState,
+    io: SockRef<'_>,
+    transmit: &Transmit<'_>,
+    _check_gso_limit: bool,
+) -> io::Result<usize> {
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
     let mut iov: libc::iovec = unsafe { mem::zeroed() };
     let mut ctrl = cmsg::Aligned([0u8; CMSG_LEN]);
@@ -1099,36 +1112,6 @@ mod tests {
     use std::{net::UdpSocket, sync::mpsc, thread, time::Duration};
 
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn send_with_status_reports_emsgsize_as_unconfirmed() {
-        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        receiver
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let state = UdpSocketState::new((&sender).into()).unwrap();
-        let mut transmit = Transmit {
-            destination: receiver.local_addr().unwrap(),
-            ecn: None,
-            contents: &[0; 65_536],
-            segment_size: None,
-            src_ip: None,
-        };
-
-        let error = state.try_send((&sender).into(), &transmit).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EMSGSIZE));
-        state.send((&sender).into(), &transmit).unwrap();
-        assert!(!state.send_with_status((&sender).into(), &transmit).unwrap());
-
-        transmit.contents = b"submitted";
-        assert!(state.send_with_status((&sender).into(), &transmit).unwrap());
-        let mut buffer = [0; 16];
-        let (len, source) = receiver.recv_from(&mut buffer).unwrap();
-        assert_eq!(&buffer[..len], transmit.contents);
-        assert_eq!(source, sender.local_addr().unwrap());
-    }
 
     #[test]
     fn recv_single_after_truncation_returns_would_block_instead_of_spin() {

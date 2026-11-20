@@ -17,6 +17,7 @@ use crate::{
     cmsg::{self, CMsgHdr},
     handle_send_error,
     log::debug,
+    send_status,
 };
 
 /// QUIC-friendly UDP socket for Windows
@@ -154,7 +155,7 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(socket, transmit) {
+        match send(socket, transmit, transmit.segment_size) {
             Ok(_) => Ok(()),
             Err(e) => handle_send_error(&self.last_send_error, e, transmit),
         }
@@ -162,22 +163,27 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] with the error handling of [`Self::send`].
     ///
-    /// Returns `true` for complete local submission and `false` for partial submission or a
-    /// suppressed error.
+    /// Returns `true` when all requested datagrams were submitted locally. Returns `false` for an
+    /// unsupported descriptor, partial submission, or a suppressed error. Unsupported descriptors
+    /// are rejected before sending.
     pub fn send_with_status(
         &self,
         socket: UdpSockRef<'_>,
         transmit: &Transmit<'_>,
     ) -> io::Result<bool> {
-        match send(socket, transmit) {
-            Ok(sent) => Ok(sent == transmit.contents.len()),
-            Err(e) => handle_send_error(&self.last_send_error, e, transmit).map(|()| false),
-        }
+        let Some(expected) = transmit.expected_send_count(|| self.max_gso_segments()) else {
+            return Ok(false);
+        };
+        let segment_size = transmit
+            .segment_size
+            .filter(|&size| size < transmit.contents.len());
+        let result = send(socket, transmit, segment_size);
+        send_status(&self.last_send_error, transmit, result, expected)
     }
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(socket, transmit).map(drop)
+        send(socket, transmit, transmit.segment_size).map(drop)
     }
 
     pub fn recv(
@@ -333,7 +339,11 @@ impl UdpSocketState {
     }
 }
 
-fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
+fn send(
+    socket: UdpSockRef<'_>,
+    transmit: &Transmit<'_>,
+    segment_size: Option<usize>,
+) -> io::Result<usize> {
     // we cannot use [`socket2::sendmsg()`] and [`socket2::MsgHdr`] as we do not have access
     // to the inner field which holds the WSAMSG
     let mut ctrl_buf = cmsg::Aligned([0; CMSG_LEN]);
@@ -399,7 +409,7 @@ fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
     }
 
     // Segment size is a u32 https://learn.microsoft.com/en-us/windows/win32/api/ws2tcpip/nf-ws2tcpip-wsasetudpsendmessagesize
-    if let Some(segment_size) = transmit.segment_size {
+    if let Some(segment_size) = segment_size {
         encoder.push(
             WinSock::IPPROTO_UDP,
             WinSock::UDP_SEND_MSG_SIZE,

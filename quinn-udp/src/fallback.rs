@@ -4,7 +4,9 @@ use std::{
     time::Instant,
 };
 
-use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, handle_send_error};
+use super::{
+    IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, handle_send_error, send_status,
+};
 
 /// Fallback UDP socket interface that stubs out all special functionality
 ///
@@ -44,17 +46,19 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] with the error handling of [`Self::send`].
     ///
-    /// Returns `true` for complete local submission and `false` for partial submission or a
-    /// suppressed error.
+    /// Returns `true` when all requested datagrams were submitted locally. Returns `false` for an
+    /// unsupported descriptor, partial submission, or a suppressed error. Unsupported descriptors
+    /// are rejected before sending.
     pub fn send_with_status(
         &self,
         socket: UdpSockRef<'_>,
         transmit: &Transmit<'_>,
     ) -> io::Result<bool> {
-        match send(socket, transmit) {
-            Ok(sent) => Ok(sent == transmit.contents.len()),
-            Err(e) => handle_send_error(&self.last_send_error, e, transmit).map(|()| false),
-        }
+        let Some(expected) = transmit.expected_send_count(|| self.max_gso_segments()) else {
+            return Ok(false);
+        };
+        let result = send(socket, transmit);
+        send_status(&self.last_send_error, transmit, result, expected)
     }
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
