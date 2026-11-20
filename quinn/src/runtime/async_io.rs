@@ -115,6 +115,10 @@ impl AsyncUdpSocket for UdpSocket {
         self.inner.send((&self.io).into(), transmit)
     }
 
+    fn try_send_with_status(&self, transmit: &udp::Transmit) -> io::Result<bool> {
+        self.inner.send_with_status((&self.io).into(), transmit)
+    }
+
     fn poll_recv(
         &self,
         cx: &mut Context,

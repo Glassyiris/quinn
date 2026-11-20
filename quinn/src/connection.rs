@@ -24,6 +24,7 @@ use crate::{
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
+    send_receipt::Receipts,
     send_stream::SendStream,
     udp_transmit,
 };
@@ -256,6 +257,18 @@ impl ConnectionDriver {
     }
 }
 
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        let Some(mut state) = self.conn.state.lock_if_unpoisoned("ConnectionDriver::drop") else {
+            return;
+        };
+        if state.error.is_none() {
+            // Runtime shutdown may drop this task while stream handles and receipts outlive it.
+            state.terminate(ConnectionError::LocallyClosed, &self.conn.shared);
+        }
+    }
+}
+
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
@@ -266,6 +279,11 @@ impl Future for ConnectionDriver {
         if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
             conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
+        }
+        // STOP, connection loss and rejected early data invalidate observers before a buffered
+        // transmit can be retried. No ordinary connection needs an extra event poll.
+        if conn.receipts.is_some() {
+            conn.forward_app_events(&self.conn.shared);
         }
         let mut keep_going = conn.drive_transmit(cx).inspect_err(|_| {
             // Transmit failed, so close the connection and clean state before returning the error.
@@ -945,6 +963,7 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                receipts: None,
             }),
             shared: Shared::default(),
         }))
@@ -968,7 +987,9 @@ impl Drop for ConnectionRef {
             return;
         }
 
-        let conn = &mut *self.state.lock("drop");
+        let Some(mut conn) = self.state.lock_if_unpoisoned("drop") else {
+            return;
+        };
 
         if !conn.inner.is_closed() {
             // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
@@ -1029,6 +1050,7 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    pub(crate) receipts: Option<Box<Receipts>>,
 }
 
 impl State {
@@ -1048,10 +1070,18 @@ impl State {
                 None => {
                     self.send_buffer.clear();
                     self.send_buffer.reserve(self.inner.current_mtu() as usize);
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
+                    let transmit = match self.receipts.as_mut() {
+                        Some(receipts) => self.inner.poll_transmit_with_streams(
+                            now,
+                            max_datagrams,
+                            &mut self.send_buffer,
+                            |id, range| receipts.capture(id, range),
+                        ),
+                        None => self
+                            .inner
+                            .poll_transmit(now, max_datagrams, &mut self.send_buffer),
+                    };
+                    match transmit {
                         Some(t) => {
                             transmits += match t.segment_size {
                                 None => 1,
@@ -1070,22 +1100,27 @@ impl State {
                 return Ok(false);
             }
 
-            let len = t.size;
-            let retry = match self
-                .socket
-                .try_send(&udp_transmit(&t, &self.send_buffer[..len]))
-            {
-                Ok(()) => false,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                Err(e) => return Err(e),
+            let transmit = udp_transmit(&t, &self.send_buffer[..t.size]);
+            let sent = match self.receipts.as_deref_mut().filter(|r| r.needs_status()) {
+                Some(receipts) => match self.socket.try_send_with_status(&transmit) {
+                    Ok(confirmed) => {
+                        receipts.submitted(confirmed);
+                        if receipts.is_empty() {
+                            self.receipts = None;
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
+                None => self.socket.try_send(&transmit),
             };
-            if retry {
-                // We thought the socket was writable, but it wasn't. Retry so that either another
-                // `poll_writable` call determines that the socket is indeed not writable and
-                // registers us for a wakeup, or the send succeeds if this really was just a
-                // transient failure.
-                self.buffered_transmit = Some(t);
-                continue;
+            match sent {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.buffered_transmit = Some(t);
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {
@@ -1161,6 +1196,11 @@ impl State {
                         wake_all(&mut self.blocked_writers);
                         wake_all(&mut self.blocked_readers);
                         wake_all_notify(&mut self.stopped);
+                        // The driver holds the lock from processing rejection to publishing
+                        // Connected; no replacement stream can have registered a write yet.
+                        if let Some(receipts) = self.receipts.take() {
+                            receipts.fail_all(crate::WriteError::ZeroRttRejected);
+                        }
                     }
                 }
                 ConnectionLost { reason } => {
@@ -1185,7 +1225,8 @@ impl State {
                     shared.stream_budget_available[dir as usize].notify_waiters();
                 }
                 Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
-                Stream(StreamEvent::Stopped { id, .. }) => {
+                Stream(StreamEvent::Stopped { id, error_code }) => {
+                    self.fail_stream_receipts(id, crate::WriteError::Stopped(error_code));
                     wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
                 }
@@ -1236,6 +1277,15 @@ impl State {
         true
     }
 
+    pub(crate) fn fail_stream_receipts(&mut self, id: StreamId, error: crate::WriteError) {
+        if let Some(book) = &mut self.receipts {
+            book.fail_stream(id, error);
+            if book.is_empty() {
+                self.receipts = None;
+            }
+        }
+    }
+
     /// Wake up a blocked `Driver` task to process I/O
     pub(crate) fn wake(&mut self) {
         if let Some(x) = self.driver.take() {
@@ -1246,6 +1296,9 @@ impl State {
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
         self.error = Some(reason.clone());
+        if let Some(receipts) = self.receipts.take() {
+            receipts.fail_all(crate::WriteError::ConnectionLost(reason.clone()));
+        }
         if let Some(x) = self.on_handshake_data.take() {
             let _ = x.send(());
         }

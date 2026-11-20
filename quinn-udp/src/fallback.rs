@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, log_sendmsg_error};
+use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, handle_send_error};
 
 /// Fallback UDP socket interface that stubs out all special functionality
 ///
@@ -37,19 +37,29 @@ impl UdpSocketState {
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         match send(socket, transmit) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-            Err(e) => {
-                log_sendmsg_error(&self.last_send_error, e, transmit);
+            Ok(_) => Ok(()),
+            Err(e) => handle_send_error(&self.last_send_error, e, transmit),
+        }
+    }
 
-                Ok(())
-            }
+    /// Sends a [`Transmit`] with the error handling of [`Self::send`].
+    ///
+    /// Returns `true` for complete local submission and `false` for partial submission or a
+    /// suppressed error.
+    pub fn send_with_status(
+        &self,
+        socket: UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<bool> {
+        match send(socket, transmit) {
+            Ok(sent) => Ok(sent == transmit.contents.len()),
+            Err(e) => handle_send_error(&self.last_send_error, e, transmit).map(|()| false),
         }
     }
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(socket, transmit)
+        send(socket, transmit).map(drop)
     }
 
     pub fn recv(
@@ -116,7 +126,7 @@ impl UdpSocketState {
     }
 }
 
-fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
     socket.0.send_to(
         transmit.contents,
         &socket2::SockAddr::from(transmit.destination),

@@ -45,6 +45,8 @@ use udp::RecvMeta;
 
 use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
 
+mod send_receipt;
+
 #[test]
 fn handshake_timeout() {
     let _guard = subscribe();

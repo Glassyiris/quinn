@@ -15,7 +15,7 @@ use std::{
 use socket2::SockRef;
 
 use super::{
-    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, cmsg, log_sendmsg_error,
+    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, cmsg, handle_send_error,
 };
 
 // Adapted from https://github.com/apple-oss-distributions/xnu/blob/8d741a5de7ff4191bf97d57b9f54c2f6d4a15585/bsd/sys/socket_private.h
@@ -206,22 +206,38 @@ impl UdpSocketState {
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         match send(self, socket.0, transmit) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-            // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
-            //   these by automatically clamping the MTUD upper bound to the interface MTU.
-            Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),
-            Err(e) => {
-                log_sendmsg_error(&self.last_send_error, e, transmit);
+            Ok(_) => Ok(()),
+            Err(e) => handle_send_error(&self.last_send_error, e, transmit),
+        }
+    }
 
-                Ok(())
+    /// Sends a [`Transmit`] with the error handling of [`Self::send`].
+    ///
+    /// Returns `true` for complete local submission and `false` for partial submission or a
+    /// suppressed error.
+    pub fn send_with_status(
+        &self,
+        socket: UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<bool> {
+        match send(self, socket.0, transmit) {
+            Ok(sent) => {
+                #[cfg(apple_fast)]
+                // `sendmsg_x` returns a datagram count. Leave any unsent suffix to loss recovery.
+                let expected = transmit
+                    .segment_size
+                    .map_or(1, |size| transmit.contents.len().div_ceil(size));
+                #[cfg(not(apple_fast))]
+                let expected = transmit.contents.len();
+                Ok(sent == expected)
             }
+            Err(e) => handle_send_error(&self.last_send_error, e, transmit).map(|()| false),
         }
     }
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(self, socket.0, transmit)
+        send(self, socket.0, transmit).map(drop)
     }
 
     pub fn recv(
@@ -302,7 +318,7 @@ fn send(
     state: &UdpSocketState,
     io: SockRef<'_>,
     transmit: &Transmit<'_>,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     #[allow(unused_mut)] // only mutable on FreeBSD
     let mut encode_src_ip = true;
     #[cfg(target_os = "freebsd")]
@@ -333,7 +349,7 @@ fn send(
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &msg_hdr, 0) };
 
         if n >= 0 {
-            return Ok(());
+            return Ok(n as usize);
         }
 
         let e = io::Error::last_os_error();
@@ -382,7 +398,7 @@ fn send(
 }
 
 #[cfg(apple_fast)]
-fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
     let mut hdrs = unsafe { mem::zeroed::<[msghdr_x; BATCH_SIZE]>() };
     let mut iovs = unsafe { mem::zeroed::<[libc::iovec; BATCH_SIZE]>() };
     let mut ctrls = [cmsg::Aligned([0u8; CMSG_LEN]); BATCH_SIZE];
@@ -418,7 +434,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
         let n = unsafe { sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0) };
 
         if n >= 0 {
-            return Ok(());
+            return Ok(n as usize);
         }
 
         let e = io::Error::last_os_error();
@@ -431,7 +447,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
 }
 
 #[cfg(any(target_os = "openbsd", target_os = "netbsd", apple_slow))]
-fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
     let mut iov: libc::iovec = unsafe { mem::zeroed() };
     let mut ctrl = cmsg::Aligned([0u8; CMSG_LEN]);
@@ -449,7 +465,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) };
 
         if n >= 0 {
-            return Ok(());
+            return Ok(n as usize);
         }
 
         let e = io::Error::last_os_error();
@@ -1083,6 +1099,36 @@ mod tests {
     use std::{net::UdpSocket, sync::mpsc, thread, time::Duration};
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn send_with_status_reports_emsgsize_as_unconfirmed() {
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let state = UdpSocketState::new((&sender).into()).unwrap();
+        let mut transmit = Transmit {
+            destination: receiver.local_addr().unwrap(),
+            ecn: None,
+            contents: &[0; 65_536],
+            segment_size: None,
+            src_ip: None,
+        };
+
+        let error = state.try_send((&sender).into(), &transmit).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EMSGSIZE));
+        state.send((&sender).into(), &transmit).unwrap();
+        assert!(!state.send_with_status((&sender).into(), &transmit).unwrap());
+
+        transmit.contents = b"submitted";
+        assert!(state.send_with_status((&sender).into(), &transmit).unwrap());
+        let mut buffer = [0; 16];
+        let (len, source) = receiver.recv_from(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], transmit.contents);
+        assert_eq!(source, sender.local_addr().unwrap());
+    }
 
     #[test]
     fn recv_single_after_truncation_returns_would_block_instead_of_spin() {

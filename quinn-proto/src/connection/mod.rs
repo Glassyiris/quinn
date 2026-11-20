@@ -1056,6 +1056,28 @@ impl Connection {
         })
     }
 
+    /// Like [`poll_transmit`](Self::poll_transmit), also visiting the stream byte ranges in the
+    /// returned transmit. This is packetization metadata, not evidence of a successful send.
+    #[must_use]
+    pub fn poll_transmit_with_streams(
+        &mut self,
+        now: Instant,
+        max_datagrams: usize,
+        buf: &mut Vec<u8>,
+        mut visit: impl FnMut(StreamId, std::ops::Range<u64>),
+    ) -> Option<Transmit> {
+        let first = self.spaces[SpaceId::Data].next_packet_number;
+        let transmit = self.poll_transmit(now, max_datagrams, buf)?;
+        for (_, packet) in self.spaces[SpaceId::Data].sent_packets.range(first..) {
+            for frame in &packet.stream_frames {
+                if !frame.offsets.is_empty() {
+                    visit(frame.id, frame.offsets.clone());
+                }
+            }
+        }
+        Some(transmit)
+    }
+
     /// Send PATH_CHALLENGE for a previous path if necessary
     fn send_path_challenge(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
         let (prev_cid, prev_path) = self.prev_path.as_mut()?;

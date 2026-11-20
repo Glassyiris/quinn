@@ -306,6 +306,16 @@ impl<'a> SendStream<'a> {
         Ok(written)
     }
 
+    /// The offset of the next byte to be written by the application.
+    pub fn write_offset(&self) -> Result<u64, ClosedStream> {
+        let stream = self
+            .state
+            .send
+            .get(&self.id)
+            .ok_or(ClosedStream { _private: () })?;
+        Ok(stream.as_deref().map_or(0, Send::offset))
+    }
+
     /// Check if this stream was stopped, get the reason if it was
     pub fn stopped(&self) -> Result<Option<VarInt>, ClosedStream> {
         match self.state.send.get(&self.id).as_ref() {

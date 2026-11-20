@@ -34,6 +34,7 @@ use std::os::unix::io::AsFd;
 use std::os::windows::io::AsSocket;
 #[cfg(not(wasm_browser))]
 use std::{
+    io,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -179,6 +180,25 @@ fn log_sendmsg_error(
 // No-op
 #[cfg(not(any(wasm_browser, feature = "tracing", feature = "direct-log")))]
 fn log_sendmsg_error(_: &Mutex<Instant>, _: impl core::fmt::Debug, _: &Transmit) {}
+
+#[cfg(not(wasm_browser))]
+#[inline]
+fn handle_send_error(
+    last_send_error: &Mutex<Instant>,
+    error: io::Error,
+    transmit: &Transmit<'_>,
+) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return Err(error);
+    }
+    // EMSGSIZE is expected for MTU probes on Unix.
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EMSGSIZE) {
+        return Ok(());
+    }
+    log_sendmsg_error(last_send_error, error, transmit);
+    Ok(())
+}
 
 /// A borrowed UDP socket
 ///

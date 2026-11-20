@@ -68,6 +68,12 @@ impl AsyncUdpSocket for UdpSocket {
         })
     }
 
+    fn try_send_with_status(&self, transmit: &udp::Transmit) -> io::Result<bool> {
+        self.io.try_io(Interest::WRITABLE, || {
+            self.inner.send_with_status((&self.io).into(), transmit)
+        })
+    }
+
     fn poll_recv(
         &self,
         cx: &mut Context,

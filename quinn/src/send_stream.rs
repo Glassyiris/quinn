@@ -10,7 +10,7 @@ use proto::{ClosedStream, ConnectionError, FinishError, StreamId, Written};
 use thiserror::Error;
 
 use crate::{
-    VarInt,
+    SendReceipt, VarInt,
     connection::{ConnectionRef, State},
 };
 
@@ -57,7 +57,17 @@ impl SendStream {
     ///
     /// This method is cancellation safe. If this does not resolve, no bytes were written.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
-        poll_fn(|cx| self.execute_poll(cx, |s| s.write(buf))).await
+        poll_fn(|cx| self.execute_poll(cx, |state, id| state.inner.send_stream(id).write(buf)))
+            .await
+    }
+
+    /// Like [`write`](Self::write), with a local submission receipt for exactly the accepted prefix.
+    pub async fn write_with_receipt(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<(usize, SendReceipt), WriteError> {
+        self.write_tracked(|stream| stream.write(buf).map(|n| (n, n)))
+            .await
     }
 
     /// Write a buffer into this stream in its entirety
@@ -97,7 +107,43 @@ impl SendStream {
     ///
     /// This method is cancellation safe. If this does not resolve, no bytes were written.
     pub async fn write_chunks(&mut self, bufs: &mut [Bytes]) -> Result<Written, WriteError> {
-        poll_fn(|cx| self.execute_poll(cx, |s| s.write_chunks(bufs))).await
+        poll_fn(|cx| {
+            self.execute_poll(cx, |state, id| {
+                state.inner.send_stream(id).write_chunks(bufs)
+            })
+        })
+        .await
+    }
+
+    /// Like [`write_chunks`](Self::write_chunks), with one receipt for the accepted bytes across chunks.
+    pub async fn write_chunks_with_receipt(
+        &mut self,
+        bufs: &mut [Bytes],
+    ) -> Result<(Written, SendReceipt), WriteError> {
+        self.write_tracked(|stream| {
+            stream
+                .write_chunks(bufs)
+                .map(|written| (written, written.bytes))
+        })
+        .await
+    }
+
+    async fn write_tracked<R>(
+        &mut self,
+        mut write: impl FnMut(&mut proto::SendStream<'_>) -> Result<(R, usize), proto::WriteError>,
+    ) -> Result<(R, SendReceipt), WriteError> {
+        let conn = &self.conn;
+        poll_fn(|cx| {
+            self.execute_poll(cx, |state, id| {
+                let mut stream = state.inner.send_stream(id);
+                let (result, size) = write(&mut stream)?;
+                let end = stream
+                    .write_offset()
+                    .expect("stream present after successful write");
+                Ok((result, SendReceipt::register(state, conn, id, end, size)))
+            })
+        })
+        .await
     }
 
     /// Write a single [`Bytes`] into this stream in its entirety
@@ -134,9 +180,9 @@ impl SendStream {
         Ok(())
     }
 
-    fn execute_poll<F, R>(&mut self, cx: &mut Context, write_fn: F) -> Poll<Result<R, WriteError>>
+    fn execute_poll<F, R>(&self, cx: &mut Context, write_fn: F) -> Poll<Result<R, WriteError>>
     where
-        F: FnOnce(&mut proto::SendStream) -> Result<R, proto::WriteError>,
+        F: FnOnce(&mut State, StreamId) -> Result<R, proto::WriteError>,
     {
         use proto::WriteError::*;
         let mut conn = self.conn.state.lock("SendStream::poll_write");
@@ -148,7 +194,7 @@ impl SendStream {
             return Poll::Ready(Err(WriteError::ConnectionLost(x.clone())));
         }
 
-        let result = match write_fn(&mut conn.inner.send_stream(self.stream)) {
+        let result = match write_fn(&mut conn, self.stream) {
             Ok(result) => result,
             Err(Blocked) => {
                 conn.blocked_writers.insert(self.stream, cx.waker().clone());
@@ -207,6 +253,7 @@ impl SendStream {
             return Ok(());
         }
         conn.inner.send_stream(self.stream).reset(error_code)?;
+        conn.fail_stream_receipts(self.stream, WriteError::ClosedStream);
         conn.wake();
         Ok(())
     }
@@ -356,6 +403,7 @@ impl Drop for SendStream {
             Ok(()) => conn.wake(),
             Err(FinishError::Stopped(reason)) => {
                 if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
+                    conn.fail_stream_receipts(self.stream, WriteError::Stopped(reason));
                     conn.wake();
                 }
             }
