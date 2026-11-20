@@ -1,6 +1,7 @@
 use std::{
     fmt::Debug,
     ops::{Deref, DerefMut},
+    sync::{LockResult, PoisonError},
 };
 
 #[cfg(feature = "lock_tracking")]
@@ -42,19 +43,21 @@ mod tracking {
         ///
         /// The purpose will be recorded in the list of last lock owners
         pub(crate) fn lock(&self, purpose: &'static str) -> MutexGuard<'_, T> {
-            self.lock_if_unpoisoned(purpose).expect("poisoned mutex")
+            self.lock_result(purpose).expect("poisoned mutex")
         }
 
-        pub(crate) fn lock_if_unpoisoned(
-            &self,
-            purpose: &'static str,
-        ) -> Option<MutexGuard<'_, T>> {
+        pub(crate) fn lock_result(&self, purpose: &'static str) -> LockResult<MutexGuard<'_, T>> {
             // We don't bother dispatching through Runtime::now because they're pure performance
             // diagnostics.
             let now = Instant::now();
-            let guard = self.inner.lock().ok()?;
-
+            let guard = self.inner.lock();
             let lock_time = Instant::now();
+            let wrap = |guard| MutexGuard {
+                guard,
+                start_time: lock_time,
+                purpose,
+            };
+            let guard = guard.map_err(|e| PoisonError::new(wrap(e.into_inner())))?;
             let elapsed = lock_time.duration_since(now);
 
             if elapsed > Duration::from_millis(1) {
@@ -64,11 +67,12 @@ mod tracking {
                 );
             }
 
-            Some(MutexGuard {
-                guard,
-                start_time: lock_time,
-                purpose,
-            })
+            Ok(wrap(guard))
+        }
+
+        #[cfg(all(test, any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")))]
+        pub(crate) fn is_available(&self) -> bool {
+            self.inner.try_lock().is_ok()
         }
     }
 
@@ -141,16 +145,20 @@ mod non_tracking {
         ///
         /// The purpose will be recorded in the list of last lock owners
         pub(crate) fn lock(&self, purpose: &'static str) -> MutexGuard<'_, T> {
-            self.lock_if_unpoisoned(purpose).expect("poisoned mutex")
+            self.lock_result(purpose).expect("poisoned mutex")
         }
 
-        pub(crate) fn lock_if_unpoisoned(
-            &self,
-            _purpose: &'static str,
-        ) -> Option<MutexGuard<'_, T>> {
-            Some(MutexGuard {
-                guard: self.inner.lock().ok()?,
-            })
+        pub(crate) fn lock_result(&self, _purpose: &'static str) -> LockResult<MutexGuard<'_, T>> {
+            let wrap = |guard| MutexGuard { guard };
+            self.inner
+                .lock()
+                .map(wrap)
+                .map_err(|e| PoisonError::new(wrap(e.into_inner())))
+        }
+
+        #[cfg(all(test, any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")))]
+        pub(crate) fn is_available(&self) -> bool {
+            self.inner.try_lock().is_ok()
         }
     }
 

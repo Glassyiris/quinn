@@ -1,32 +1,30 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
     future::Future,
     io,
     ops::Range,
     pin::Pin,
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
 };
 
 use proto::StreamId;
 use tokio::sync::oneshot;
 
-use crate::connection::{ConnectionRef, State};
+use crate::{WriteError, connection::State};
 
 /// Evidence of local UDP submission for the bytes accepted by one stream write.
 ///
-/// Resolves successfully only after all those bytes have been submitted to the local socket.
-/// This is not a peer acknowledgment. If the socket cannot confirm a submission, the receipt
-/// fails without changing QUIC's normal loss recovery. Dropping it cancels observation, not I/O.
+/// Succeeds when the local socket confirms submission of the entire accepted prefix. An empty
+/// prefix completes immediately. Peer delivery and acknowledgment can happen later.
+/// Dropping a receipt cancels observation. It neither withdraws accepted bytes nor keeps the
+/// connection open. A receipt error can occur even when bytes reached the peer. Do not write the
+/// accepted bytes again solely because their receipt failed; doing so can duplicate application data.
 #[must_use = "await the receipt to observe local submission"]
 #[derive(Debug)]
-pub struct SendReceipt(Option<Registration>);
+pub struct SendReceipt(Option<oneshot::Receiver<Submission>>);
 
-#[derive(Debug)]
-struct Registration {
-    conn: ConnectionRef,
-    key: Key,
-    result: oneshot::Receiver<io::Result<()>>,
-}
+// A socket may accept the transmit without confirming that every datagram was submitted.
+type Submission = Result<bool, WriteError>;
 
 // Writes on a stream have disjoint nonempty ranges. The end offset stays fixed as the first
 // unconfirmed byte advances, so it also serves as the ordered lookup key for intersecting frames.
@@ -34,7 +32,7 @@ type Key = (StreamId, u64);
 
 struct Pending {
     next: u64,
-    result: oneshot::Sender<io::Result<()>>,
+    result: oneshot::Sender<Submission>,
 }
 
 #[derive(Default)]
@@ -45,35 +43,21 @@ pub(crate) struct Receipts {
 }
 
 impl SendReceipt {
-    pub(crate) fn register(
-        state: &mut State,
-        conn: &ConnectionRef,
-        stream: StreamId,
-        end: u64,
-        len: usize,
-    ) -> Self {
-        if len == 0 {
-            return Self(None);
-        }
+    pub(crate) fn empty() -> Self {
+        Self(None)
+    }
+
+    pub(crate) fn register(state: &mut State, stream: StreamId, end: u64, len: usize) -> Self {
+        let pending = &mut state.receipts.get_or_insert_with(Default::default).pending;
+        let Entry::Vacant(entry) = pending.entry((stream, end)) else {
+            unreachable!("nonempty accepted writes have distinct end offsets");
+        };
         let (tx, result) = oneshot::channel();
-        let key = (stream, end);
-        let old = state
-            .receipts
-            .get_or_insert_with(Default::default)
-            .pending
-            .insert(
-                key,
-                Pending {
-                    next: end - len as u64,
-                    result: tx,
-                },
-            );
-        debug_assert!(old.is_none());
-        Self(Some(Registration {
-            conn: conn.clone(),
-            key,
-            result,
-        }))
+        entry.insert(Pending {
+            next: end - len as u64,
+            result: tx,
+        });
+        Self(Some(result))
     }
 }
 
@@ -81,33 +65,56 @@ impl Future for SendReceipt {
     type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Some(registration) = &mut self.0 else {
+        let Some(receiver) = &mut self.0 else {
             return Poll::Ready(Ok(()));
         };
-        let result = ready!(Pin::new(&mut registration.result).poll(cx));
-        self.0 = None;
-        Poll::Ready(result.unwrap_or_else(|_| Err(io::ErrorKind::ConnectionAborted.into())))
+        Pin::new(receiver).poll(cx).map(|result| match result {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(io::Error::other("UDP socket did not confirm submission")),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(io::ErrorKind::ConnectionAborted.into()),
+        })
     }
 }
 
-impl Drop for SendReceipt {
-    fn drop(&mut self) {
-        if let Some(r) = &mut self.0 {
-            r.result.close();
-            let Some(mut state) = r.conn.state.lock_if_unpoisoned("SendReceipt::drop") else {
-                return;
-            };
-            if let Some(book) = &mut state.receipts {
-                // After rejected 0-RTT the same stream ID and offset can belong to a new write.
-                if book
-                    .pending
-                    .get(&r.key)
-                    .is_some_and(|p| p.result.is_closed())
-                {
-                    book.pending.remove(&r.key);
+// Detach senders under the connection lock. Only the caller that released the lock may notify
+// (or drop) them, because a receipt waker can synchronously call back into the connection.
+#[derive(Default)]
+pub(crate) struct ReceiptNotifications {
+    first: Option<Completion>,
+    more: Vec<Completion>,
+}
+
+enum Completion {
+    One(oneshot::Sender<Submission>, Submission),
+    All(Box<Receipts>, WriteError),
+}
+
+impl ReceiptNotifications {
+    fn push(&mut self, completion: Completion) {
+        if self.first.is_none() {
+            self.first = Some(completion);
+        } else {
+            self.more.push(completion);
+        }
+    }
+
+    pub(crate) fn fail_all(&mut self, receipts: Box<Receipts>, error: WriteError) {
+        self.push(Completion::All(receipts, error));
+    }
+
+    pub(crate) fn notify(self) {
+        for completion in self.first.into_iter().chain(self.more) {
+            match completion {
+                Completion::One(sender, result) => {
+                    let _ = sender.send(result);
                 }
-                if book.is_empty() {
-                    state.receipts = None;
+                Completion::All(receipts, error) => {
+                    for pending in receipts.pending.into_values() {
+                        if !pending.result.is_closed() {
+                            let _ = pending.result.send(Err(error.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -132,51 +139,58 @@ impl Receipts {
         }
     }
 
-    pub(crate) fn needs_status(&self) -> bool {
-        !self.batch.is_empty()
+    pub(crate) fn needs_status(&mut self, notifications: &mut ReceiptNotifications) -> bool {
+        // A canceled write costs at most one entry per still-queued nonempty prefix. Reclaim
+        // it on its next transmit (or stream/connection teardown), including a buffered retry.
+        while let Some((key, _)) = self.batch.last() {
+            if let Entry::Occupied(entry) = self.pending.entry(*key) {
+                if !entry.get().result.is_closed() {
+                    return true;
+                }
+                notifications.push(Completion::One(entry.remove().result, Ok(false)));
+            }
+            self.batch.pop();
+        }
+        false
     }
 
-    pub(crate) fn submitted(&mut self, confirmed: bool) {
+    pub(crate) fn submitted(&mut self, confirmed: bool, notifications: &mut ReceiptNotifications) {
         for (key, range) in self.batch.drain(..) {
-            let Some(pending) = self.pending.get_mut(&key) else {
+            let Entry::Occupied(mut entry) = self.pending.entry(key) else {
                 continue;
             };
+            let pending = entry.get_mut();
             if range.end <= pending.next {
                 continue;
             }
-            let result = if confirmed {
+            if confirmed {
                 // Fresh STREAM data is packetized in offset order. Retransmits may revisit a
                 // prefix, but must never fill a gap merely by carrying a later byte.
                 if range.start > pending.next {
                     continue;
                 }
                 pending.next = range.end;
-                if pending.next < key.1 {
+                if pending.next < key.1 && !pending.result.is_closed() {
                     continue;
                 }
-                Ok(())
-            } else {
-                Err(io::Error::other("UDP socket did not confirm submission"))
-            };
-            let _ = self.pending.remove(&key).unwrap().result.send(result);
+            }
+            let complete = confirmed && pending.next == key.1;
+            notifications.push(Completion::One(entry.remove().result, Ok(complete)));
         }
     }
 
-    pub(crate) fn fail_stream(&mut self, stream: StreamId, error: crate::WriteError) {
+    pub(crate) fn fail_stream(
+        &mut self,
+        stream: StreamId,
+        error: WriteError,
+        notifications: &mut ReceiptNotifications,
+    ) {
         while let Some((&key, _)) = self.pending.range((stream, 0)..=(stream, u64::MAX)).next() {
-            let _ = self
-                .pending
-                .remove(&key)
-                .unwrap()
-                .result
-                .send(Err(error.clone().into()));
+            notifications.push(Completion::One(
+                self.pending.remove(&key).unwrap().result,
+                Err(error.clone()),
+            ));
         }
         self.batch.retain(|(key, _)| key.0 != stream);
-    }
-
-    pub(crate) fn fail_all(self, error: crate::WriteError) {
-        for pending in self.pending.into_values() {
-            let _ = pending.result.send(Err(error.clone().into()));
-        }
     }
 }

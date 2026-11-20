@@ -62,6 +62,10 @@ impl SendStream {
     }
 
     /// Like [`write`](Self::write), with a local submission receipt for exactly the accepted prefix.
+    ///
+    /// Canceling this write before it returns accepts no bytes. Once it returns, dropping the
+    /// [`SendReceipt`] cancels only observation. An accepted empty prefix has an immediately
+    /// successful receipt.
     pub async fn write_with_receipt(
         &mut self,
         buf: &[u8],
@@ -116,6 +120,10 @@ impl SendStream {
     }
 
     /// Like [`write_chunks`](Self::write_chunks), with one receipt for the accepted bytes across chunks.
+    ///
+    /// Canceling this write before it returns leaves the chunks untouched. After success the
+    /// accepted bytes have been consumed from `bufs`, even if the [`SendReceipt`] is dropped or
+    /// later fails. A successful zero-byte write has an immediately successful receipt.
     pub async fn write_chunks_with_receipt(
         &mut self,
         bufs: &mut [Bytes],
@@ -132,15 +140,17 @@ impl SendStream {
         &mut self,
         mut write: impl FnMut(&mut proto::SendStream<'_>) -> Result<(R, usize), proto::WriteError>,
     ) -> Result<(R, SendReceipt), WriteError> {
-        let conn = &self.conn;
         poll_fn(|cx| {
             self.execute_poll(cx, |state, id| {
                 let mut stream = state.inner.send_stream(id);
                 let (result, size) = write(&mut stream)?;
+                if size == 0 {
+                    return Ok((result, SendReceipt::empty()));
+                }
                 let end = stream
                     .write_offset()
                     .expect("stream present after successful write");
-                Ok((result, SendReceipt::register(state, conn, id, end, size)))
+                Ok((result, SendReceipt::register(state, id, end, size)))
             })
         })
         .await
@@ -248,14 +258,17 @@ impl SendStream {
     /// called. This error is harmless and serves only to indicate that the caller may have
     /// incorrect assumptions about the stream's state.
     pub fn reset(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
-        let mut conn = self.conn.state.lock("SendStream::reset");
-        if self.is_0rtt && conn.check_0rtt().is_err() {
-            return Ok(());
-        }
-        conn.inner.send_stream(self.stream).reset(error_code)?;
-        conn.fail_stream_receipts(self.stream, WriteError::ClosedStream);
-        conn.wake();
-        Ok(())
+        self.conn
+            .with_receipt_notifications("SendStream::reset", |conn, notifications| {
+                if self.is_0rtt && conn.check_0rtt().is_err() {
+                    return Ok(());
+                }
+                conn.inner.send_stream(self.stream).reset(error_code)?;
+                conn.fail_stream_receipts(self.stream, WriteError::ClosedStream, notifications);
+                conn.wake();
+                Ok(())
+            })
+            .expect("poisoned mutex")
     }
 
     /// Set the priority of the send stream
@@ -391,25 +404,31 @@ impl tokio::io::AsyncWrite for SendStream {
 
 impl Drop for SendStream {
     fn drop(&mut self) {
-        let mut conn = self.conn.state.lock("SendStream::drop");
+        let _ = self
+            .conn
+            .with_receipt_notifications("SendStream::drop", |conn, notifications| {
+                // Clean up any previously registered wakers.
+                conn.blocked_writers.remove(&self.stream);
 
-        // clean up any previously registered wakers
-        conn.blocked_writers.remove(&self.stream);
-
-        if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
-            return;
-        }
-        match conn.inner.send_stream(self.stream).finish() {
-            Ok(()) => conn.wake(),
-            Err(FinishError::Stopped(reason)) => {
-                if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
-                    conn.fail_stream_receipts(self.stream, WriteError::Stopped(reason));
-                    conn.wake();
+                if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
+                    return;
                 }
-            }
-            // Already finished or reset, which is fine.
-            Err(FinishError::ClosedStream) => {}
-        }
+                match conn.inner.send_stream(self.stream).finish() {
+                    Ok(()) => conn.wake(),
+                    Err(FinishError::Stopped(reason)) => {
+                        if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
+                            conn.fail_stream_receipts(
+                                self.stream,
+                                WriteError::Stopped(reason),
+                                notifications,
+                            );
+                            conn.wake();
+                        }
+                    }
+                    // Already finished or reset, which is fine.
+                    Err(FinishError::ClosedStream) => {}
+                }
+            });
     }
 }
 
