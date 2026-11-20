@@ -40,3 +40,42 @@ async fn buffered_stream_bytes_recover_after_socket_downgrade() {
     .await
     .expect("timed out checking recovery after a socket downgrade");
 }
+
+#[tokio::test]
+async fn fresh_transmit_uses_limit_after_a_dropped_batch() {
+    timeout(DEADLINE, async {
+        let socket = GatedSocket::with_segment_limit(2);
+        let (endpoint, server) = loopback_endpoints(socket.clone(), localhost_socket());
+        let (client, peer) = establish(&endpoint, &server).await;
+        let mut first = client.open_uni().await.unwrap();
+        first.set_priority(1).unwrap();
+        let mut second = client.open_uni().await.unwrap();
+        let a = gen_data(STREAM_WINDOW as usize, 3);
+        let b = gen_data(STREAM_WINDOW as usize, 4);
+        socket.set_mode(super::Mode::DowngradeNextBatch);
+        let (n, dropped) = first.write_with_receipt(&a).await.unwrap();
+        let (m, fresh) = second.write_with_receipt(&b).await.unwrap();
+        assert_eq!((n, m), (a.len(), b.len()));
+        first.finish().unwrap();
+        second.finish().unwrap();
+
+        assert_eq!(dropped.await.unwrap_err().kind(), io::ErrorKind::Other);
+        fresh.await.unwrap();
+        assert!(!socket.gate.lock().unwrap().invalid_transmit);
+        for _ in 0..2 {
+            let mut stream = peer.accept_uni().await.unwrap();
+            let expected = if stream.id() == first.id() {
+                &a
+            } else {
+                assert_eq!(stream.id(), second.id());
+                &b
+            };
+            assert_eq!(
+                stream.read_to_end(expected.len()).await.unwrap().as_slice(),
+                expected.as_slice()
+            );
+        }
+    })
+    .await
+    .expect("both streams must recover at the new segment limit");
+}

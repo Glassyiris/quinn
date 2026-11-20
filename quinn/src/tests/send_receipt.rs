@@ -5,7 +5,7 @@ use std::{
     pin::{Pin, pin},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     time::Duration,
@@ -34,6 +34,7 @@ enum Mode {
     Blocked,
     One,
     DropOne,
+    DowngradeNextBatch,
     Fail,
 }
 
@@ -49,7 +50,7 @@ struct Gate {
 #[derive(Debug)]
 struct GatedSocket {
     inner: Arc<dyn AsyncUdpSocket>,
-    segment_limit: usize,
+    segment_limit: AtomicUsize,
     gate: Mutex<Gate>,
     blocked: Notify,
 }
@@ -62,7 +63,7 @@ impl GatedSocket {
     fn with_segment_limit(segment_limit: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: localhost_socket(),
-            segment_limit,
+            segment_limit: AtomicUsize::new(segment_limit),
             gate: Mutex::default(),
             blocked: Notify::new(),
         })
@@ -106,7 +107,7 @@ impl GatedSocket {
         let segments = transmit
             .segment_size
             .map_or(1, |stride| transmit.contents.len().div_ceil(stride));
-        if segments > self.segment_limit {
+        if segments > self.max_transmit_segments() {
             gate.invalid_transmit = true;
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -119,6 +120,11 @@ impl GatedSocket {
             Mode::Fail => return Err(io::Error::other("injected UDP send failure")),
             Mode::DropOne => {
                 gate.mode = Mode::BlockNext;
+                return Ok(false);
+            }
+            Mode::DowngradeNextBatch if segments > 1 => {
+                self.segment_limit.store(1, Ordering::Relaxed);
+                gate.mode = Mode::Open;
                 return Ok(false);
             }
             _ => {}
@@ -194,7 +200,7 @@ impl AsyncUdpSocket for GatedSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        self.segment_limit
+        self.segment_limit.load(Ordering::Relaxed)
     }
 
     fn max_receive_segments(&self) -> usize {

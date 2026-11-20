@@ -1117,11 +1117,6 @@ impl State {
         let now = self.runtime.now();
         let mut transmits = 0;
 
-        let max_datagrams = self
-            .socket
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
-
         loop {
             // Retry the last transmit, or get a new one.
             let t = match self.buffered_transmit.take() {
@@ -1149,6 +1144,11 @@ impl State {
                 None => {
                     self.send_buffer.clear();
                     self.send_buffer.reserve(self.inner.current_mtu() as usize);
+                    // A previous send can disable GSO within this driver turn.
+                    let max_datagrams = self
+                        .socket
+                        .max_transmit_segments()
+                        .min(MAX_TRANSMIT_SEGMENTS);
                     let transmit = match self.receipts.as_mut() {
                         Some(receipts) => self.inner.poll_transmit_with_streams(
                             now,
