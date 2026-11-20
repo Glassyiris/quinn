@@ -58,6 +58,15 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// to register the calling task to be woken when a send should be attempted again.
     fn try_send(&self, transmit: &Transmit) -> io::Result<()>;
 
+    /// Send UDP datagrams with the readiness and error semantics of [`Self::try_send`].
+    ///
+    /// Returns `true` only when every datagram in `transmit` was submitted to the local socket.
+    /// A `false` result can indicate a dropped, partially submitted, or unconfirmed transmit.
+    /// The default implementation sends with [`Self::try_send`] and reports `false` on success.
+    fn try_send_with_status(&self, transmit: &Transmit) -> io::Result<bool> {
+        self.try_send(transmit).map(|()| false)
+    }
+
     /// Receive UDP datagrams, or register to be woken if receiving may succeed in the future
     fn poll_recv(
         &self,

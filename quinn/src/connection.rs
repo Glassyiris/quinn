@@ -24,6 +24,7 @@ use crate::{
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
+    send_receipt::{ReceiptNotifications, Receipts},
     send_stream::SendStream,
     udp_transmit,
 };
@@ -256,46 +257,36 @@ impl ConnectionDriver {
     }
 }
 
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        let _ = self.conn.with_receipt_notifications(
+            "ConnectionDriver::drop",
+            |state, notifications| {
+                if state.error.is_none() {
+                    // A runtime may drop its driver while application handles can still issue writes.
+                    state.terminate(
+                        ConnectionError::LocallyClosed,
+                        &self.conn.shared,
+                        notifications,
+                    );
+                }
+            },
+        );
+    }
+}
+
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let conn = &mut *self.conn.state.lock("poll");
+        let shared = &self.conn.shared;
         let _guard = self.span.enter();
 
-        if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
-            conn.terminate(e, &self.conn.shared);
-            return Poll::Ready(Ok(()));
-        }
-        let mut keep_going = conn.drive_transmit(cx).inspect_err(|_| {
-            // Transmit failed, so close the connection and clean state before returning the error.
-            if !conn.inner.is_closed() {
-                conn.implicit_close(&self.conn.shared);
-            }
-        })?;
-
-        // If a timer expires, there might be more to transmit. When we transmit something, we
-        // might need to reset a timer. Hence, we must loop until neither happens.
-        keep_going |= conn.drive_timer(cx);
-        conn.forward_endpoint_events();
-        conn.forward_app_events(&self.conn.shared);
-
-        if !conn.inner.is_drained() {
-            if keep_going {
-                // If the connection hasn't processed all tasks, schedule it again
-                cx.waker().wake_by_ref();
-            } else {
-                match conn.driver.as_mut() {
-                    Some(old_waker) => old_waker.clone_from(cx.waker()),
-                    None => conn.driver = Some(cx.waker().clone()),
-                };
-            }
-            return Poll::Pending;
-        }
-        if conn.error.is_none() {
-            unreachable!("drained connections always have an error");
-        }
-        Poll::Ready(Ok(()))
+        self.conn
+            .with_receipt_notifications("poll", |conn, notifications| {
+                conn.poll(shared, cx, notifications)
+            })
+            .expect("poisoned mutex")
     }
 }
 
@@ -304,7 +295,8 @@ impl Future for ConnectionDriver {
 /// If all references to a connection (including every clone of the `Connection` handle, streams of
 /// incoming streams, and the various stream types) have been dropped, then the connection will be
 /// automatically closed with an `error_code` of 0 and an empty `reason`. You can also close the
-/// connection explicitly by calling [`Connection::close()`].
+/// connection explicitly by calling [`Connection::close()`]. A [`crate::SendReceipt`] can be
+/// retained or dropped independently of these handles.
 ///
 /// Closing the connection immediately abandons efforts to deliver data to the peer.  Upon
 /// receiving CONNECTION_CLOSE the peer *may* drop any stream data not yet delivered to the
@@ -445,8 +437,21 @@ impl Connection {
     /// [`Endpoint::wait_idle()`]: crate::Endpoint::wait_idle
     /// [`close()`]: Connection::close
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
-        let conn = &mut *self.0.state.lock("close");
-        conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);
+        self.0
+            .with_receipt_notifications("close", |conn, notifications| {
+                conn.close(
+                    error_code,
+                    Bytes::copy_from_slice(reason),
+                    &self.0.shared,
+                    notifications,
+                );
+            })
+            .expect("poisoned mutex");
+    }
+
+    #[cfg(all(test, any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")))]
+    pub(crate) fn state_lock_available(&self) -> bool {
+        self.0.state.is_available()
     }
 
     /// Transmit `data` as an unreliable, unordered application datagram
@@ -945,9 +950,34 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                receipts: None,
             }),
             shared: Shared::default(),
         }))
+    }
+
+    /// A receipt can run arbitrary application wakers. Release the protocol mutex before sending
+    /// any outcome or dropping a detached sender, including when the locked operation unwinds.
+    pub(crate) fn with_receipt_notifications<T>(
+        &self,
+        purpose: &'static str,
+        f: impl FnOnce(&mut State, &mut ReceiptNotifications) -> T,
+    ) -> Option<T> {
+        let mut notifications = ReceiptNotifications::default();
+        let mut state = match self.state.lock_result(purpose) {
+            Ok(state) => state,
+            Err(poisoned) => {
+                // Only detach observers from poisoned state. The guard drops at the semicolon,
+                // before dropping the book wakes receivers with ConnectionAborted.
+                let abandoned = poisoned.into_inner().receipts.take();
+                drop(abandoned);
+                return None;
+            }
+        };
+        let result = f(&mut state, &mut notifications);
+        drop(state);
+        notifications.notify();
+        Some(result)
     }
 
     fn stable_id(&self) -> usize {
@@ -968,15 +998,15 @@ impl Drop for ConnectionRef {
             return;
         }
 
-        let conn = &mut *self.state.lock("drop");
-
-        if !conn.inner.is_closed() {
-            // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
-            // not, we can't do any harm. If there were any streams being opened, then either
-            // the connection will be closed for an unrelated reason or a fresh reference will
-            // be constructed for the newly opened stream.
-            conn.implicit_close(&self.shared);
-        }
+        let _ = self.with_receipt_notifications("drop", |conn, notifications| {
+            if !conn.inner.is_closed() {
+                // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
+                // not, we can't do any harm. If there were any streams being opened, then either
+                // the connection will be closed for an unrelated reason or a fresh reference will
+                // be constructed for the newly opened stream.
+                conn.implicit_close(&self.shared, notifications);
+            }
+        });
     }
 }
 
@@ -1029,30 +1059,113 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    pub(crate) receipts: Option<Box<Receipts>>,
 }
 
 impl State {
-    fn drive_transmit(&mut self, cx: &mut Context) -> io::Result<bool> {
+    fn poll(
+        &mut self,
+        shared: &Shared,
+        cx: &mut Context<'_>,
+        notifications: &mut ReceiptNotifications,
+    ) -> Poll<io::Result<()>> {
+        if let Err(e) = self.process_conn_events(shared, cx, notifications) {
+            self.terminate(e, shared, notifications);
+            return Poll::Ready(Ok(()));
+        }
+        // STOP, connection loss and rejected early data invalidate observers before a buffered
+        // transmit can be retried. No ordinary connection needs an extra event poll.
+        if self.receipts.is_some() {
+            self.forward_app_events(shared, notifications);
+        }
+        let mut keep_going = self.drive_transmit(cx, notifications).inspect_err(|_| {
+            // Transmit failed, so close the connection and clean state before returning the error.
+            if !self.inner.is_closed() {
+                self.implicit_close(shared, notifications);
+            }
+        })?;
+
+        // If a timer expires, there might be more to transmit. When we transmit something, we
+        // might need to reset a timer. Hence, we must loop until neither happens.
+        keep_going |= self.drive_timer(cx);
+        self.forward_endpoint_events();
+        self.forward_app_events(shared, notifications);
+
+        if !self.inner.is_drained() {
+            if keep_going {
+                // If the connection hasn't processed all tasks, schedule it again
+                cx.waker().wake_by_ref();
+            } else {
+                match self.driver.as_mut() {
+                    Some(old_waker) => old_waker.clone_from(cx.waker()),
+                    None => self.driver = Some(cx.waker().clone()),
+                };
+            }
+            return Poll::Pending;
+        }
+        if self.error.is_none() {
+            unreachable!("drained connections always have an error");
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn drive_transmit(
+        &mut self,
+        cx: &mut Context,
+        notifications: &mut ReceiptNotifications,
+    ) -> io::Result<bool> {
         let now = self.runtime.now();
         let mut transmits = 0;
-
-        let max_datagrams = self
-            .socket
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
 
         loop {
             // Retry the last transmit, or get a new one.
             let t = match self.buffered_transmit.take() {
-                Some(t) => t,
+                Some(t) => {
+                    if self.io_poller.as_mut().poll_writable(cx)?.is_pending() {
+                        self.buffered_transmit = Some(t);
+                        return Ok(false);
+                    }
+                    if t.segment_size
+                        .is_some_and(|s| t.size.div_ceil(s) > self.socket.max_transmit_segments())
+                    {
+                        // Readiness or WouldBlock retained this entire unsent transmit. After a
+                        // rebind or GSO downgrade the socket may no longer preserve its boundaries.
+                        // QUIC loss recovery will repacketize the data with the current limit.
+                        if let Some(receipts) = &mut self.receipts {
+                            receipts.submitted(false, notifications);
+                            if receipts.is_empty() {
+                                self.receipts = None;
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    t
+                }
                 None => {
                     self.send_buffer.clear();
                     self.send_buffer.reserve(self.inner.current_mtu() as usize);
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
+                    // A previous send can disable GSO within this driver turn.
+                    let max_datagrams = self
+                        .socket
+                        .max_transmit_segments()
+                        .min(MAX_TRANSMIT_SEGMENTS);
+                    let transmit = match self.receipts.as_mut() {
+                        Some(receipts) => self.inner.poll_transmit_with_streams(
+                            now,
+                            max_datagrams,
+                            &mut self.send_buffer,
+                            |id, range| receipts.capture(id, range),
+                        ),
+                        None => self
+                            .inner
+                            .poll_transmit(now, max_datagrams, &mut self.send_buffer),
+                    };
+                    match transmit {
                         Some(t) => {
+                            if self.io_poller.as_mut().poll_writable(cx)?.is_pending() {
+                                self.buffered_transmit = Some(t);
+                                return Ok(false);
+                            }
                             transmits += match t.segment_size {
                                 None => 1,
                                 Some(s) => t.size.div_ceil(s), // round up
@@ -1064,28 +1177,33 @@ impl State {
                 }
             };
 
-            if self.io_poller.as_mut().poll_writable(cx)?.is_pending() {
-                // Retry after a future wakeup
-                self.buffered_transmit = Some(t);
-                return Ok(false);
-            }
-
-            let len = t.size;
-            let retry = match self
-                .socket
-                .try_send(&udp_transmit(&t, &self.send_buffer[..len]))
-            {
-                Ok(()) => false,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                Err(e) => return Err(e),
+            let transmit = udp_transmit(&t, &self.send_buffer[..t.size]);
+            let sent = match &mut self.receipts {
+                Some(receipts) => {
+                    let result = if receipts.needs_status(notifications) {
+                        self.socket
+                            .try_send_with_status(&transmit)
+                            .map(|confirmed| {
+                                receipts.submitted(confirmed, notifications);
+                            })
+                    } else {
+                        self.socket.try_send(&transmit)
+                    };
+                    if receipts.is_empty() {
+                        self.receipts = None;
+                    }
+                    result
+                }
+                None => self.socket.try_send(&transmit),
             };
-            if retry {
-                // We thought the socket was writable, but it wasn't. Retry so that either another
-                // `poll_writable` call determines that the socket is indeed not writable and
-                // registers us for a wakeup, or the send succeeds if this really was just a
-                // transient failure.
-                self.buffered_transmit = Some(t);
-                continue;
+            match sent {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Retry the same bytes only after the socket poller reports writability again.
+                    self.buffered_transmit = Some(t);
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {
@@ -1112,6 +1230,7 @@ impl State {
         &mut self,
         shared: &Shared,
         cx: &mut Context,
+        notifications: &mut ReceiptNotifications,
     ) -> Result<(), ConnectionError> {
         loop {
             match self.conn_events.poll_recv(cx) {
@@ -1124,7 +1243,7 @@ impl State {
                     self.inner.handle_event(event);
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
-                    self.close(error_code, reason, shared);
+                    self.close(error_code, reason, shared, notifications);
                 }
                 Poll::Ready(None) => {
                     return Err(ConnectionError::TransportError(proto::TransportError {
@@ -1140,7 +1259,7 @@ impl State {
         }
     }
 
-    fn forward_app_events(&mut self, shared: &Shared) {
+    fn forward_app_events(&mut self, shared: &Shared, notifications: &mut ReceiptNotifications) {
         while let Some(event) = self.inner.poll() {
             use proto::Event::*;
             match event {
@@ -1161,10 +1280,14 @@ impl State {
                         wake_all(&mut self.blocked_writers);
                         wake_all(&mut self.blocked_readers);
                         wake_all_notify(&mut self.stopped);
+                        // The lock excludes replacement stream IDs until the rejected book is detached.
+                        if let Some(receipts) = self.receipts.take() {
+                            notifications.fail_all(receipts, crate::WriteError::ZeroRttRejected);
+                        }
                     }
                 }
                 ConnectionLost { reason } => {
-                    self.terminate(reason, shared);
+                    self.terminate(reason, shared, notifications);
                 }
                 Stream(StreamEvent::Writable { id }) => wake_stream(id, &mut self.blocked_writers),
                 Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
@@ -1185,7 +1308,12 @@ impl State {
                     shared.stream_budget_available[dir as usize].notify_waiters();
                 }
                 Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
-                Stream(StreamEvent::Stopped { id, .. }) => {
+                Stream(StreamEvent::Stopped { id, error_code }) => {
+                    self.fail_stream_receipts(
+                        id,
+                        crate::WriteError::Stopped(error_code),
+                        notifications,
+                    );
                     wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
                 }
@@ -1236,6 +1364,20 @@ impl State {
         true
     }
 
+    pub(crate) fn fail_stream_receipts(
+        &mut self,
+        id: StreamId,
+        error: crate::WriteError,
+        notifications: &mut ReceiptNotifications,
+    ) {
+        if let Some(book) = &mut self.receipts {
+            book.fail_stream(id, error, notifications);
+            if book.is_empty() {
+                self.receipts = None;
+            }
+        }
+    }
+
     /// Wake up a blocked `Driver` task to process I/O
     pub(crate) fn wake(&mut self) {
         if let Some(x) = self.driver.take() {
@@ -1244,8 +1386,16 @@ impl State {
     }
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
-    fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
+    fn terminate(
+        &mut self,
+        reason: ConnectionError,
+        shared: &Shared,
+        notifications: &mut ReceiptNotifications,
+    ) {
         self.error = Some(reason.clone());
+        if let Some(receipts) = self.receipts.take() {
+            notifications.fail_all(receipts, crate::WriteError::ConnectionLost(reason));
+        }
         if let Some(x) = self.on_handshake_data.take() {
             let _ = x.send(());
         }
@@ -1264,15 +1414,21 @@ impl State {
         shared.closed.notify_waiters();
     }
 
-    fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {
+    fn close(
+        &mut self,
+        error_code: VarInt,
+        reason: Bytes,
+        shared: &Shared,
+        notifications: &mut ReceiptNotifications,
+    ) {
         self.inner.close(self.runtime.now(), error_code, reason);
-        self.terminate(ConnectionError::LocallyClosed, shared);
+        self.terminate(ConnectionError::LocallyClosed, shared, notifications);
         self.wake();
     }
 
     /// Close for a reason other than the application's explicit request
-    pub(crate) fn implicit_close(&mut self, shared: &Shared) {
-        self.close(0u32.into(), Bytes::new(), shared);
+    fn implicit_close(&mut self, shared: &Shared, notifications: &mut ReceiptNotifications) {
+        self.close(0u32.into(), Bytes::new(), shared, notifications);
     }
 
     pub(crate) fn check_0rtt(&self) -> Result<(), ()> {

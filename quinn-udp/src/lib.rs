@@ -34,6 +34,7 @@ use std::os::unix::io::AsFd;
 use std::os::windows::io::AsSocket;
 #[cfg(not(wasm_browser))]
 use std::{
+    io,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -146,6 +147,42 @@ pub struct Transmit<'a> {
     pub src_ip: Option<IpAddr>,
 }
 
+#[cfg(not(wasm_browser))]
+impl Transmit<'_> {
+    fn expected_send_count(&self, max_gso_segments: impl FnOnce() -> usize) -> Option<usize> {
+        let len = self.contents.len();
+        if cfg!(apple_fast) && len == 0 {
+            // The batched Apple send path requires a nonempty chunk.
+            return None;
+        }
+        #[cfg(windows)]
+        if u32::try_from(len).is_err() {
+            // WSABUF and the segmentation control message both use u32.
+            return None;
+        }
+
+        let segments = match self.segment_size {
+            Some(0) => return None,
+            Some(size) if size < len => {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if u16::try_from(size).is_err() {
+                    // UDP_SEGMENT must carry the requested size without truncation.
+                    return None;
+                }
+                let segments = len.div_ceil(size);
+                if segments > max_gso_segments() {
+                    return None;
+                }
+                segments
+            }
+            _ => 1,
+        };
+
+        // sendmsg_x reports datagrams. The other native APIs report bytes.
+        Some(if cfg!(apple_fast) { segments } else { len })
+    }
+}
+
 /// Log at most 1 IO error per minute
 #[cfg(not(wasm_browser))]
 const IO_ERROR_LOG_INTERVAL: Duration = std::time::Duration::from_secs(60);
@@ -179,6 +216,66 @@ fn log_sendmsg_error(
 // No-op
 #[cfg(not(any(wasm_browser, feature = "tracing", feature = "direct-log")))]
 fn log_sendmsg_error(_: &Mutex<Instant>, _: impl core::fmt::Debug, _: &Transmit) {}
+
+#[cfg(not(wasm_browser))]
+#[inline]
+fn handle_send_error(
+    last_send_error: &Mutex<Instant>,
+    error: io::Error,
+    transmit: &Transmit<'_>,
+) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return Err(error);
+    }
+    // EMSGSIZE is expected for MTU probes on Unix.
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EMSGSIZE) {
+        return Ok(());
+    }
+    log_sendmsg_error(last_send_error, error, transmit);
+    Ok(())
+}
+
+#[cfg(not(wasm_browser))]
+fn send_status(
+    last_send_error: &Mutex<Instant>,
+    transmit: &Transmit<'_>,
+    result: io::Result<usize>,
+    expected: usize,
+) -> io::Result<bool> {
+    match result {
+        Ok(sent) => Ok(sent == expected),
+        Err(e) => handle_send_error(last_send_error, e, transmit).map(|()| false),
+    }
+}
+
+#[cfg(all(test, not(wasm_browser)))]
+mod send_status_tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[test]
+    fn send_with_status_uses_native_count_units() {
+        let transmit = Transmit {
+            destination: (Ipv4Addr::LOCALHOST, 0).into(),
+            ecn: None,
+            contents: b"0123456789abc",
+            segment_size: Some(5),
+            src_ip: None,
+        };
+        assert_eq!(transmit.expected_send_count(|| 2), None);
+        let expected = transmit.expected_send_count(|| 3).unwrap();
+        assert_eq!(expected, if cfg!(apple_fast) { 3 } else { 13 });
+
+        // Exercise count conversion without relying on an OS to produce a short send.
+        let last_send_error = Mutex::new(Instant::now());
+        let status = |sent| send_status(&last_send_error, &transmit, Ok(sent), expected).unwrap();
+        assert!(status(expected));
+        assert!(!status(expected - 1));
+        assert!(!status(expected + 1));
+    }
+}
 
 /// A borrowed UDP socket
 ///

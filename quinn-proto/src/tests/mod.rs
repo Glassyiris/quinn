@@ -4163,6 +4163,48 @@ fn min_mtu_does_not_pad_zero_rtt_batch_tail() {
 }
 
 #[test]
+fn segmented_transmit_reports_only_its_stream_bytes() {
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    let now = pair.time + Duration::from_millis(200);
+    let id = pair.client_streams(client).open(Dir::Uni).unwrap();
+    let payload: Vec<u8> = (0..8_000).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        pair.client_send(client, id).write(&payload).unwrap(),
+        payload.len()
+    );
+    let mut wire = Vec::new();
+    let mut end = 0;
+    let tx = pair
+        .client_conn_mut(client)
+        .poll_transmit_with_streams(now, 2, &mut wire, |stream, bytes| {
+            assert_eq!(stream, id);
+            assert_eq!(bytes.start, end);
+            end = bytes.end;
+        })
+        .expect("pending stream bytes");
+    let segment = tx
+        .segment_size
+        .expect("multiple UDP datagrams in one transmit");
+    assert!(segment < tx.size);
+    assert!(0 < end && end < payload.len() as u64);
+    for datagram in wire[..tx.size].chunks(segment) {
+        pair.server
+            .inbound
+            .push_back((now, tx.ecn, BytesMut::from(datagram)));
+    }
+    pair.server.drive(now, pair.client.addr);
+    let mut recv = pair.server_recv(server, id);
+    let mut chunks = recv.read(true).unwrap();
+    let mut actual = Vec::new();
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        actual.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(actual, payload[..end as usize]);
+}
+
+#[test]
 fn min_mtu_limits_application_loss_probes() {
     let _guard = subscribe();
     const MIN_MTU: u16 = 1280;

@@ -1,9 +1,10 @@
 #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
 use std::net::{SocketAddr, SocketAddrV6};
 use std::{
-    io::IoSliceMut,
+    io::{self, IoSliceMut, Write as _},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, UdpSocket},
     slice,
+    time::Duration,
 };
 
 use quinn_udp::{EcnCodepoint, RecvMeta, Transmit, UdpSocketState};
@@ -206,6 +207,101 @@ fn gso() {
             segment_size: Some(SEGMENT_SIZE),
             src_ip: None,
         },
+    );
+}
+
+#[test]
+fn send_with_status_datagram_boundaries() {
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let state = UdpSocketState::new((&sender).into()).unwrap();
+    let datagrams: [&[u8]; 2] = [&[0xA1; 128], &[0xB2; 71]];
+    let contents = datagrams.concat();
+    let mut transmit = Transmit {
+        destination: receiver.local_addr().unwrap(),
+        ecn: None,
+        contents: &contents,
+        segment_size: Some(datagrams[0].len()),
+        src_ip: None,
+    };
+
+    let max_segments = state.max_gso_segments();
+    let submitted = state.send_with_status((&sender).into(), &transmit).unwrap();
+    let evidence = if max_segments > 1 {
+        assert!(
+            submitted,
+            "advertised segmentation did not submit both datagrams"
+        );
+        assert_udp_datagrams(&receiver, &sender, &datagrams);
+        "received both datagrams including the short tail"
+    } else {
+        assert!(!submitted, "single-datagram backend confirmed a batch");
+        transmit.contents = datagrams[1];
+        assert!(state.send_with_status((&sender).into(), &transmit).unwrap());
+        assert_udp_datagrams(&receiver, &sender, &datagrams[1..]);
+        "rejected the batch and received only the standalone tail"
+    };
+
+    // Make the capability exercised visible in the existing CI jobs.
+    writeln!(
+        io::stderr().lock(),
+        "send_with_status_datagram_boundaries {evidence} (max_gso_segments={max_segments})"
+    )
+    .unwrap();
+}
+
+#[test]
+fn send_with_status_reports_native_error_as_unconfirmed() {
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let state = UdpSocketState::new((&sender).into()).unwrap();
+    let mut transmit = Transmit {
+        destination: receiver.local_addr().unwrap(),
+        ecn: None,
+        contents: &[0; 65_536],
+        segment_size: None,
+        src_ip: None,
+    };
+
+    let error = state.try_send((&sender).into(), &transmit).unwrap_err();
+    assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+    #[cfg(target_os = "linux")]
+    assert_eq!(error.raw_os_error(), Some(libc::EMSGSIZE));
+    #[cfg(windows)]
+    assert_eq!(
+        error.raw_os_error(),
+        Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE)
+    );
+    state.send((&sender).into(), &transmit).unwrap();
+    assert!(!state.send_with_status((&sender).into(), &transmit).unwrap());
+
+    transmit.contents = b"submitted";
+    assert!(state.send_with_status((&sender).into(), &transmit).unwrap());
+    assert_udp_datagrams(&receiver, &sender, &[transmit.contents]);
+}
+
+fn assert_udp_datagrams(receiver: &UdpSocket, sender: &UdpSocket, expected: &[&[u8]]) {
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let source = sender.local_addr().unwrap();
+    let mut buffer = [0; 256];
+    for &expected in expected {
+        let (len, address) = receiver.recv_from(&mut buffer).unwrap();
+        assert_eq!(address, source);
+        assert_eq!(&buffer[..len], expected);
+    }
+
+    receiver
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let error = receiver.recv_from(&mut buffer).unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+        "unexpected receive error {error}"
     );
 }
 
