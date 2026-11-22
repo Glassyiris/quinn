@@ -140,8 +140,8 @@ impl Receipts {
     }
 
     pub(crate) fn needs_status(&mut self, notifications: &mut ReceiptNotifications) -> bool {
-        // A canceled write costs at most one entry per still-queued nonempty prefix. Reclaim
-        // it on its next transmit (or stream/connection teardown), including a buffered retry.
+        // A dropped receipt leaves at most one entry for its queued range. Reclaim it on
+        // the next matching transmit (including a buffered retry) or stream/connection teardown.
         while let Some((key, _)) = self.batch.last() {
             if let Entry::Occupied(entry) = self.pending.entry(*key) {
                 if !entry.get().result.is_closed() {
