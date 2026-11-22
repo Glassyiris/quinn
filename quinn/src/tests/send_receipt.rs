@@ -22,6 +22,7 @@ use crate::{
 };
 
 mod rebind;
+mod suffix;
 
 const DEADLINE: Duration = Duration::from_secs(5);
 const STREAM_WINDOW: u32 = 3_000;
@@ -33,6 +34,7 @@ enum Mode {
     BlockNext,
     Blocked,
     One,
+    ForwardUnconfirmed,
     DropOne,
     DowngradeNextBatch,
     Fail,
@@ -118,6 +120,11 @@ impl GatedSocket {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
             Mode::Fail => return Err(io::Error::other("injected UDP send failure")),
+            Mode::ForwardUnconfirmed => {
+                self.forward(transmit, false)?;
+                gate.mode = Mode::BlockNext;
+                return Ok(false);
+            }
             Mode::DropOne => {
                 gate.mode = Mode::BlockNext;
                 return Ok(false);
