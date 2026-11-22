@@ -123,10 +123,21 @@ impl SendStream {
         &mut self,
         bufs: &mut [Bytes],
     ) -> Result<(Written, SendReceipt), WriteError> {
+        self.write_chunks_with_receipt_after(bufs, 0).await
+    }
+
+    /// Like [`write_chunks`](Self::write_chunks), but skip `untracked_prefix` bytes of this
+    /// write when tracking submission. If the write accepts no bytes beyond that prefix,
+    /// the receipt is already complete. Canceling the write leaves `bufs` untouched.
+    pub async fn write_chunks_with_receipt_after(
+        &mut self,
+        bufs: &mut [Bytes],
+        untracked_prefix: usize,
+    ) -> Result<(Written, SendReceipt), WriteError> {
         self.write_tracked(|stream| {
             stream
                 .write_chunks(bufs)
-                .map(|written| (written, written.bytes))
+                .map(|written| (written, written.bytes.saturating_sub(untracked_prefix)))
         })
         .await
     }

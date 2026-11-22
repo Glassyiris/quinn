@@ -12,10 +12,10 @@ use tokio::sync::oneshot;
 
 use crate::{WriteError, connection::State};
 
-/// Evidence of local UDP submission for the bytes accepted by one stream write.
+/// Evidence of local UDP submission for the tracked bytes of one stream write.
 ///
-/// Succeeds when the local socket confirms submission of the entire accepted prefix. An empty
-/// prefix completes immediately. Peer delivery and acknowledgment can happen later.
+/// Succeeds when the local socket confirms submission of the entire tracked range. An empty
+/// range completes immediately. Peer delivery and acknowledgment can happen later.
 /// Dropping a receipt cancels observation. It neither withdraws accepted bytes nor keeps the
 /// connection open. A receipt error can occur even when bytes reached the peer. Do not write the
 /// accepted bytes again solely because their receipt failed; doing so can duplicate application data.
