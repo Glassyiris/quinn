@@ -98,6 +98,12 @@ async fn empty_suffix_preserves_short_write_and_blocked_retry() {
 
 #[tokio::test]
 async fn suffix_includes_the_last_byte_of_a_short_write() {
+    for skip_first_packet in [false, true] {
+        check_short_write_boundary(skip_first_packet).await;
+    }
+}
+
+async fn check_short_write_boundary(skip_first_packet: bool) {
     timeout(DEADLINE, async {
         let (client, server, gate, ack_gate) = connect().await;
         let mut warm = client.open_uni().await.unwrap();
@@ -147,8 +153,9 @@ async fn suffix_includes_the_last_byte_of_a_short_write() {
         data.extend_from_slice(b"Z!");
         let data = Bytes::from(data);
         let mut chunks = [data.slice(..1), data.slice(1..)];
+        let skip = if skip_first_packet { boundary } else { 1 };
         let (w, mut receipt) = send
-            .write_chunks_with_receipt_after(&mut chunks, 1)
+            .write_chunks_with_receipt_after(&mut chunks, skip)
             .await
             .unwrap();
         assert_eq!((w.bytes, w.chunks), (boundary + 1, 1));
@@ -156,22 +163,35 @@ async fn suffix_includes_the_last_byte_of_a_short_write() {
         send.finish().unwrap();
         gate.wait_for_stream_packet(&client, frames).await;
         let first_frames = client.stats().frame_tx.stream;
-        gate.set_mode(Mode::One);
+        gate.set_mode(if skip_first_packet {
+            Mode::ForwardUnconfirmed
+        } else {
+            Mode::One
+        });
         let mut recv = server.accept_uni().await.unwrap();
         assert_eq!(recv.id(), send.id());
         let chunk = recv.read_chunk(usize::MAX, true).await.unwrap().unwrap();
         assert_eq!(chunk.offset, 0);
         assert_eq!(chunk.bytes, data.slice(..boundary));
+        assert!(poll_once(recv.read_chunk(1, true)).is_pending());
         assert!(
             poll_once(&mut receipt).is_pending(),
             "the final accepted byte is still held"
         );
         gate.wait_for_stream_packet(&client, first_frames).await;
-        gate.set_mode(Mode::ForwardUnconfirmed);
+        gate.set_mode(if skip_first_packet {
+            Mode::One
+        } else {
+            Mode::ForwardUnconfirmed
+        });
         let chunk = recv.read_chunk(usize::MAX, true).await.unwrap().unwrap();
         assert_eq!(chunk.offset, boundary as u64);
         assert_eq!(&chunk.bytes[..], b"Z");
-        assert_eq!(receipt.await.unwrap_err().kind(), io::ErrorKind::Other);
+        if skip_first_packet {
+            receipt.await.unwrap();
+        } else {
+            assert_eq!(receipt.await.unwrap_err().kind(), io::ErrorKind::Other);
+        }
         gate.set_mode(Mode::Open);
         ack_gate.set_mode(Mode::Open);
         assert!(recv.read_to_end(0).await.unwrap().is_empty());
